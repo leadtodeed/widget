@@ -1,0 +1,60 @@
+{
+  "name": "leadtodeed-widget",
+  "version": "0.2.0",
+  "description": "Embeddable click-to-call phone widget for Asterisk/FreePBX via JsSIP WebRTC",
+  "type": "module",
+  "main": "dist/leadtodeed-widget.iife.js",
+  "module": "dist/leadtodeed-widget.esm.js",
+  "exports": {
+    ".": {
+      "import": "./dist/leadtodeed-widget.esm.js",
+      "default": "./dist/leadtodeed-widget.iife.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rollup -c",
+    "watch": "rollup -c --watch",
+    "lint": "eslint src/",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run lint && npm run test && npm run build"
+  },
+  "keywords": [
+    "webrtc",
+    "sip",
+    "jssip",
+    "asterisk",
+    "freepbx",
+    "click-to-call",
+    "phone",
+    "widget"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leadtodeed/widget.git"
+  },
+  "homepage": "https://github.com/leadtodeed/widget#readme",
+  "bugs": {
+    "url": "https://github.com/leadtodeed/widget/issues"
+  },
+  "dependencies": {
+    "jssip": "^3.10.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@rollup/plugin-commonjs": "^25.0.7",
+    "@rollup/plugin-json": "^6.1.0",
+    "@rollup/plugin-node-resolve": "^15.2.3",
+    "eslint": "^10.0.1",
+    "globals": "^17.3.0",
+    "happy-dom": "^20.7.0",
+    "rollup": "^4.9.0",
+    "vitest": "^4.0.18"
+  }
+}
