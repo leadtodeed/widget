@@ -52,11 +52,13 @@ export default function Leadtodeed({
       number: state.number,
       direction: state.direction,
       connectedAt: state.connectedAt,
+      muted: state.muted,
       events: state.events,
       accept: () => phone.answer(),
       decline: () => phone.reject(),
       hangup: () => phone.hangup(),
       sendDTMF: (digit) => phone.sendDTMF(digit),
+      toggleMute: () => phone.toggleMute(),
     })
   }
 
@@ -97,6 +99,11 @@ export default function Leadtodeed({
       transitionPhase(state, 'idle')
       notify()
     }, 2000)
+  })
+
+  phone.on('muted', ({ muted }) => {
+    state.muted = muted
+    notify()
   })
 
   phone.on('event', (event) => {

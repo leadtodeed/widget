@@ -20,6 +20,7 @@ export function createCallState() {
     number: null,
     direction: null,
     connectedAt: null,
+    muted: false,
     events: [],
   }
 }
@@ -48,6 +49,7 @@ export function transitionPhase(state, newPhase, attrs = {}) {
     state.number = null
     state.direction = null
     state.connectedAt = null
+    state.muted = false
     state.events = []
   }
   return true

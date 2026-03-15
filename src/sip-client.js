@@ -253,6 +253,22 @@ export class SipClient {
     }
   }
 
+  mute() {
+    if (this._currentSession) {
+      this._currentSession.mute({ audio: true })
+    }
+  }
+
+  unmute() {
+    if (this._currentSession) {
+      this._currentSession.unmute({ audio: true })
+    }
+  }
+
+  get isMuted() {
+    return this._currentSession ? this._currentSession.isMuted().audio : false
+  }
+
   _handleNewSession(e) {
     const session = e.session
     this._currentSession = session

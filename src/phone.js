@@ -146,6 +146,28 @@ export class LeadtodeedPhone extends EventEmitter {
     this._sip.sendDTMF(digit)
   }
 
+  mute() {
+    this._sip.mute()
+    this.emit('muted', { muted: true })
+  }
+
+  unmute() {
+    this._sip.unmute()
+    this.emit('muted', { muted: false })
+  }
+
+  toggleMute() {
+    if (this._sip.isMuted) {
+      this.unmute()
+    } else {
+      this.mute()
+    }
+  }
+
+  get isMuted() {
+    return this._sip.isMuted
+  }
+
   addEvent(type, data) {
     const event = {
       id: Date.now() + Math.random(),
