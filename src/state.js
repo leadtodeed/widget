@@ -22,6 +22,9 @@ export function createCallState() {
     connectedAt: null,
     muted: false,
     events: [],
+    participants: [],    // [{ user_id, name, extension }]
+    isConference: false,
+    bridgeId: null,
   }
 }
 
@@ -51,6 +54,9 @@ export function transitionPhase(state, newPhase, attrs = {}) {
     state.connectedAt = null
     state.muted = false
     state.events = []
+    state.participants = []
+    state.isConference = false
+    state.bridgeId = null
   }
   return true
 }

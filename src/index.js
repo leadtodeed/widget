@@ -20,6 +20,7 @@
 
 import { LeadtodeedPhone } from './phone.js'
 import { createCallState, addEvent, transitionPhase } from './state.js'
+import { CallEventsSocket } from './call-events-ws.js'
 
 /**
  * Initialize the Leadtodeed phone library.
@@ -38,6 +39,8 @@ export default function Leadtodeed({
   onIncomingCall = null,
 } = {}) {
   const state = createCallState()
+  const leadtodeedUrl = `https://${subdomain}.leadtodeed.ai`
+  let callEventsSocket = null
 
   const phone = new LeadtodeedPhone({
     subdomain,
@@ -54,16 +57,77 @@ export default function Leadtodeed({
       connectedAt: state.connectedAt,
       muted: state.muted,
       events: state.events,
+      participants: state.participants,
+      isConference: state.isConference,
       accept: () => phone.answer(),
       decline: () => phone.reject(),
       hangup: () => phone.hangup(),
       sendDTMF: (digit) => phone.sendDTMF(digit),
       toggleMute: () => phone.toggleMute(),
+      addParticipant: (userId) => _addParticipant(userId),
     })
   }
 
-  phone.on('incomingCall', async ({ callerNumber }) => {
+  async function _addParticipant(userId) {
+    const token = phone._auth?.token
+    if (!token) return
+    try {
+      const resp = await fetch(`${leadtodeedUrl}/api/conference/add`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ target_user_id: userId }),
+      })
+      if (!resp.ok) {
+        console.error('[Leadtodeed] addParticipant failed:', resp.status)
+      }
+    } catch (e) {
+      console.error('[Leadtodeed] addParticipant error:', e)
+    }
+  }
+
+  function _connectCallEventsWS() {
+    const token = phone._auth?.token
+    if (!token) return
+    const wsUrl = leadtodeedUrl.replace('https://', 'wss://') + '/api/call/events'
+    callEventsSocket = new CallEventsSocket({
+      url: wsUrl,
+      token,
+      onParticipantJoined: (data) => {
+        state.participants = [...state.participants.filter(p => p.user_id !== data.user_id), {
+          user_id: data.user_id,
+          name: data.name,
+          extension: data.extension,
+        }]
+        state.isConference = state.participants.length > 1
+        notify()
+      },
+      onParticipantLeft: (data) => {
+        state.participants = state.participants.filter(p => p.user_id !== data.user_id)
+        notify()
+      },
+      onCallEnded: () => {
+        // The bridge ended server-side; let the normal SIP callEnded handle phase transition
+      },
+    })
+    callEventsSocket.connect()
+  }
+
+  function _stopRingtone() {
+    if (ringtoneAudio) {
+      ringtoneAudio.pause()
+      ringtoneAudio.currentTime = 0
+    }
+  }
+
+  phone.on('incomingCall', async ({ callerNumber, participants: initialParticipants }) => {
     transitionPhase(state, 'ringing', { number: callerNumber, direction: 'incoming' })
+    if (initialParticipants?.length) {
+      state.participants = initialParticipants
+      state.isConference = true
+    }
     notify()
 
     if (onIncomingCall) {
@@ -86,8 +150,14 @@ export default function Leadtodeed({
     }
   })
 
-  phone.on('callConnected', () => {
+  phone.on('registered', () => {
+    // Connect participant events WS on SIP registration so both WS are always up
+    _connectCallEventsWS()
+  })
+
+  phone.on('callConnected', ({ bridgeId }) => {
     transitionPhase(state, 'connected', { connectedAt: Date.now() })
+    if (bridgeId) state.bridgeId = bridgeId
     notify()
   })
 

@@ -58,6 +58,8 @@ export class LeadtodeedPhone extends EventEmitter {
     this._callNumber = null
     this._callStartedAt = null
     this._registered = false
+    this._bridgeId = null
+    this._isConference = false
 
     // Wire up callbacks
     if (onRegistered) this.on('registered', onRegistered)
@@ -80,7 +82,7 @@ export class LeadtodeedPhone extends EventEmitter {
         this._registered = false
         this.emit('error', new Error(`SIP registration failed: ${e?.cause || 'unknown'}`))
       },
-      onNewSession: (session) => this._handleSession(session),
+      onNewSession: (session, meta) => this._handleSession(session, meta),
       onDisconnected: () => {
         this._registered = false
       },
@@ -93,6 +95,14 @@ export class LeadtodeedPhone extends EventEmitter {
 
   get isInCall() {
     return this._sip.currentSession !== null
+  }
+
+  get bridgeId() {
+    return this._bridgeId
+  }
+
+  get isConference() {
+    return this._isConference
   }
 
   get callDuration() {
@@ -221,8 +231,12 @@ export class LeadtodeedPhone extends EventEmitter {
     return this
   }
 
-  _handleSession(session) {
+  _handleSession(session, meta = {}) {
     const direction = session.direction
+
+    // Store conference metadata from SIP X-headers
+    if (meta.bridgeId) this._bridgeId = meta.bridgeId
+    if (meta.isConference) this._isConference = meta.isConference
 
     if (direction === 'incoming') {
       const remoteIdentity = session.remote_identity
@@ -230,7 +244,12 @@ export class LeadtodeedPhone extends EventEmitter {
       const callerNumber = remoteIdentity?.uri?.user || 'Unknown'
       this._callNumber = callerNumber
 
-      this.emit('incomingCall', { callerName, callerNumber })
+      this.emit('incomingCall', {
+        callerName, callerNumber,
+        bridgeId: meta.bridgeId || null,
+        isConference: meta.isConference || false,
+        participants: meta.participants || [],
+      })
     }
 
     session.on('accepted', () => {
@@ -243,12 +262,14 @@ export class LeadtodeedPhone extends EventEmitter {
 
     session.on('confirmed', () => {
       this._callStartedAt = Date.now()
-      this.emit('callConnected', { number: this._callNumber })
+      this.emit('callConnected', { number: this._callNumber, bridgeId: this._bridgeId })
     })
 
     const onEnd = (e) => {
       const duration = this.callDuration
       this._callStartedAt = null
+      this._bridgeId = null
+      this._isConference = false
       this.emit('callEnded', {
         number: this._callNumber,
         duration,

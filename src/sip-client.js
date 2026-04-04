@@ -273,8 +273,18 @@ export class SipClient {
     const session = e.session
     this._currentSession = session
 
+    // Read X-headers from incoming SIP INVITE for conference context
+    const request = session.request
+    const bridgeId = request?.getHeader?.('X-Bridge-Id') || null
+    const isConference = request?.getHeader?.('X-Conference') === 'true'
+    let participants = []
+    try {
+      const raw = request?.getHeader?.('X-Participants')
+      if (raw) participants = JSON.parse(raw)
+    } catch { /* ignore parse errors */ }
+
     this._setupSessionEvents(session)
-    this._callbacks.onNewSession?.(session)
+    this._callbacks.onNewSession?.(session, { bridgeId, isConference, participants })
   }
 
   _setupSessionEvents(session) {
