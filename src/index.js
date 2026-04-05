@@ -30,6 +30,7 @@ import { CallEventsSocket } from './call-events-ws.js'
  * @param {string} config.tokenUrl - Token endpoint path
  * @param {Function} [config.renderer] - (state) => void — called on every state change
  * @param {Function} [config.onIncomingCall] - async (callerNumber) => enrichmentData | null
+ * @param {string} [config.ringtoneUrl] - URL to an .ogg ringtone played on incoming calls
  * @returns {LeadtodeedPhone} The phone instance
  */
 export default function Leadtodeed({
@@ -37,10 +38,17 @@ export default function Leadtodeed({
   tokenUrl,
   renderer = null,
   onIncomingCall = null,
+  ringtoneUrl = null,
 } = {}) {
   const state = createCallState()
   const leadtodeedUrl = `https://${subdomain}.leadtodeed.ai`
   let callEventsSocket = null
+  let ringtoneAudio = null
+
+  if (ringtoneUrl) {
+    ringtoneAudio = new Audio(ringtoneUrl)
+    ringtoneAudio.loop = true
+  }
 
   const phone = new LeadtodeedPhone({
     subdomain,
@@ -128,6 +136,9 @@ export default function Leadtodeed({
       state.participants = initialParticipants
       state.isConference = true
     }
+    if (ringtoneAudio) {
+      ringtoneAudio.play().catch(() => {})
+    }
     notify()
 
     if (onIncomingCall) {
@@ -156,12 +167,14 @@ export default function Leadtodeed({
   })
 
   phone.on('callConnected', ({ bridgeId }) => {
+    _stopRingtone()
     transitionPhase(state, 'connected', { connectedAt: Date.now() })
     if (bridgeId) state.bridgeId = bridgeId
     notify()
   })
 
   phone.on('callEnded', () => {
+    _stopRingtone()
     transitionPhase(state, 'ended')
     notify()
 
