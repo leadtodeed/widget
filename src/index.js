@@ -72,21 +72,24 @@ export default function Leadtodeed({
       hangup: () => phone.hangup(),
       sendDTMF: (digit) => phone.sendDTMF(digit),
       toggleMute: () => phone.toggleMute(),
-      addParticipant: (userId) => _addParticipant(userId),
+      addParticipant: (userId, opts) => _addParticipant(userId, opts),
     })
   }
 
-  async function _addParticipant(userId) {
+  async function _addParticipant(userId, opts) {
     const token = phone._auth?.token
     if (!token) return
     try {
+      const body = { target_user_id: userId }
+      if (opts?.phone) body.target_user_phone = opts.phone
+      if (opts?.name) body.target_user_name = opts.name
       const resp = await fetch(`${leadtodeedUrl}/api/conference/add`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ target_user_id: userId }),
+        body: JSON.stringify(body),
       })
       if (!resp.ok) {
         console.error('[Leadtodeed] addParticipant failed:', resp.status)
