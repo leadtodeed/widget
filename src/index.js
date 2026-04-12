@@ -21,6 +21,7 @@
 import { LeadtodeedPhone } from './phone.js'
 import { createCallState, addEvent, transitionPhase } from './state.js'
 import { CallEventsSocket } from './call-events-ws.js'
+import { becomeLeader } from './leader.js'
 
 /**
  * Initialize the Leadtodeed phone library.
@@ -218,7 +219,27 @@ export default function Leadtodeed({
     // BroadcastChannel not available (SSR, old browsers)
   }
 
-  phone.connect().catch((err) => console.error("[Leadtodeed] connect failed:", err))
+  // Tab leader election: only one tab connects to SIP + call-events at a time.
+  // Followers stay passive until the leader's tab closes (browser releases the lock,
+  // next waiter wins). Cross-tab UI sync continues via BroadcastChannel above.
+  // The Homey controller already broadcasts state and relays user actions; the
+  // follower tab's local state simply stays idle (no phone events fire) and the
+  // controller's _isRemoteRender path renders state pushed by the leader.
+  const releaseLock = becomeLeader('leadtodeed-sip', async () => {
+    try {
+      await phone.connect()
+    } catch (err) {
+      console.error("[Leadtodeed] leader connect failed:", err)
+    }
+  })
+
+  // Wrap disconnect so an explicit teardown also releases the leader lock,
+  // allowing another waiting tab to take over without closing the browser tab.
+  const originalDisconnect = phone.disconnect.bind(phone)
+  phone.disconnect = () => {
+    originalDisconnect()
+    releaseLock()
+  }
 
   return phone
 }

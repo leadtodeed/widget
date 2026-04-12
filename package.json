@@ -1,6 +1,6 @@
 {
   "name": "leadtodeed-widget",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Embeddable click-to-call phone widget for Asterisk/FreePBX via JsSIP WebRTC",
   "type": "module",
   "main": "dist/leadtodeed-widget.iife.js",
