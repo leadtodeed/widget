@@ -170,7 +170,9 @@ export default function Leadtodeed({
   })
 
   phone.on('registered', () => {
-    // Connect participant events WS on SIP registration so both WS are always up
+    // Connect participant events WS on SIP registration so the socket is always up —
+    // otherwise server-emitted participant events between bridge setup and SIP connect
+    // would be lost. The socket has its own heartbeat + reconnect to stay alive.
     _connectCallEventsWS()
   })
 
