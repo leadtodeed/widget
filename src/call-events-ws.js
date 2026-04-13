@@ -47,8 +47,10 @@ export class CallEventsSocket {
   }
 
   _openSocket() {
-    const wsUrl = `${this._url}?token=${encodeURIComponent(this._token)}`
-    this._ws = new WebSocket(wsUrl)
+    // Pass JWT via Sec-WebSocket-Protocol ("bearer.<jwt>") instead of a query
+    // string so the token never appears in URLs or access logs. Server echoes
+    // the same protocol back to accept the handshake.
+    this._ws = new WebSocket(this._url, [`bearer.${this._token}`])
     this._lastMessageAt = Date.now()
 
     this._ws.onopen = () => {
