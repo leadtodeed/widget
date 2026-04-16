@@ -170,6 +170,7 @@ export class SipClient {
       password: sipConfig.sip_password,
       display_name: sipConfig.display_name,
       register: true,
+      register_expires: 60,
       session_timers: false,
     }
 
