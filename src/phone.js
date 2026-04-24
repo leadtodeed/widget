@@ -35,11 +35,30 @@
 import { EventEmitter } from './events.js'
 import { AuthManager } from './auth.js'
 import { SipClient } from './sip-client.js'
+import { Reporter } from './reporter.js'
+
+// Generate a random session identifier. Prefer crypto.randomUUID when
+// available (all evergreen browsers + HTTPS contexts); otherwise fall back
+// to a non-cryptographic 16-char token — session_id is just a correlation
+// key in logs, not a credential, so collision resistance is what matters.
+function _makeSessionId() {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID()
+    }
+  } catch { /* fall through */ }
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
+  let out = ''
+  for (let i = 0; i < 16; i++) out += chars[Math.floor(Math.random() * chars.length)]
+  return out
+}
 
 export class LeadtodeedPhone extends EventEmitter {
   constructor({
     subdomain,
     tokenUrl,
+    sessionId,
+    telemetryRateLimit,
     onRegistered,
     onCallStarted,
     onCallEnded,
@@ -55,6 +74,13 @@ export class LeadtodeedPhone extends EventEmitter {
 
     this._leadtodeedUrl = `https://${subdomain}.leadtodeed.ai`
     this._auth = new AuthManager({ tokenUrl })
+    this._sessionId = sessionId || _makeSessionId()
+    this._reporter = new Reporter({
+      leadtodeedUrl: this._leadtodeedUrl,
+      auth: this._auth,
+      sessionId: this._sessionId,
+      maxPerMinute: telemetryRateLimit,
+    })
     this._callNumber = null
     this._callStartedAt = null
     this._registered = false
@@ -70,9 +96,29 @@ export class LeadtodeedPhone extends EventEmitter {
     if (onIncomingCall) this.on('incomingCall', onIncomingCall)
     if (onError) this.on('error', onError)
 
+    this._registerCount = 0
+
     this._sip = new SipClient({
+      onWsOpened: () => {
+        // First opportunity where sip._ua.configuration.via_host is populated.
+        // Publish it into the reporter so ALL subsequent events — including
+        // heartbeats and error reports — carry this JsSIP UA's stable id.
+        const via = this._sip.viaHost
+        if (via) this._reporter.setViaHost(via)
+        this._reporter.report('info', 'sip_ws_opened', '', { via_host: via })
+      },
       onRegistered: () => {
         this._registered = true
+        this._registerCount += 1
+        if (this._registerCount === 1) {
+          this._reporter.report('info', 'register_success', '', {
+            via_host: this._sip.viaHost,
+          })
+        } else {
+          this._reporter.report('info', 'sip_register_refresh', '', {
+            count: this._registerCount,
+          })
+        }
         this.emit('registered')
       },
       onUnregistered: () => {
@@ -80,13 +126,38 @@ export class LeadtodeedPhone extends EventEmitter {
       },
       onRegistrationFailed: (e) => {
         this._registered = false
+        this._reporter.report('error', 'sip_registration_failed', e?.cause || 'unknown', {
+          response: e?.response?.status_code ?? null,
+        })
         this.emit('error', new Error(`SIP registration failed: ${e?.cause || 'unknown'}`))
       },
       onNewSession: (session, meta) => this._handleSession(session, meta),
-      onDisconnected: () => {
+      onDisconnected: (e) => {
         this._registered = false
+        this._reporter.report('warn', 'sip_ws_closed', e?.reason || '', {
+          code: e?.code ?? null,
+          was_clean: e?.was_clean ?? null,
+          duration_ms: e?.duration_ms ?? null,
+        })
       },
     })
+  }
+
+  /** JsSIP UA's via_host (the `<token>.invalid` hostname), or null before connect. */
+  get viaHost() {
+    return this._sip?.viaHost || null
+  }
+
+  /** Stable random id for this widget instance. Used as the correlation key
+   *  across session_start, heartbeat, session_end, and every reporter event. */
+  get sessionId() {
+    return this._sessionId
+  }
+
+  /** Exposed so telemetry orchestration in index.js can emit its own events
+   *  without reaching into a private field. */
+  get reporter() {
+    return this._reporter
   }
 
   get isRegistered() {

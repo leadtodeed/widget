@@ -18,11 +18,12 @@ const RECONNECT_BASE_DELAY = 1_000  // 1s
 const RECONNECT_MAX_DELAY = 30_000  // 30s cap
 
 export class CallEventsSocket {
-  constructor({ url, token, onParticipantJoined, onParticipantLeft, onCallEnded }) {
+  constructor({ url, token, reporter, onParticipantJoined, onParticipantLeft, onCallEnded, onRefresh }) {
     this._url = url
     this._token = token
+    this._reporter = reporter
     this._ws = null
-    this._callbacks = { onParticipantJoined, onParticipantLeft, onCallEnded }
+    this._callbacks = { onParticipantJoined, onParticipantLeft, onCallEnded, onRefresh }
     this._closedByUser = false
     this._reconnectAttempts = 0
     this._heartbeatTimer = null
@@ -74,6 +75,12 @@ export class CallEventsSocket {
           case 'call_ended':
             this._callbacks.onCallEnded?.(data)
             break
+          case 'refresh':
+            // Server-initiated force-reload. The orchestrator (index.js)
+            // decides whether to reload immediately or defer until the
+            // current call ends.
+            this._callbacks.onRefresh?.(data)
+            break
           case 'pong':
             // Heartbeat ack — already refreshed above
             break
@@ -85,12 +92,23 @@ export class CallEventsSocket {
 
     this._ws.onerror = (e) => {
       console.error('[Leadtodeed] WS error:', e)
+      this._reporter?.report('error', 'call_events_ws_error', 'WebSocket error', {
+        readyState: this._ws?.readyState ?? null,
+        attempts: this._reconnectAttempts,
+      })
     }
 
-    this._ws.onclose = () => {
+    this._ws.onclose = (e) => {
       this._clearTimers()
       this._ws = null
-      if (!this._closedByUser) this._scheduleReconnect()
+      if (!this._closedByUser) {
+        this._reporter?.report('warn', 'call_events_ws_closed', e?.reason || 'closed', {
+          code: e?.code ?? null,
+          wasClean: e?.wasClean ?? null,
+          attempts: this._reconnectAttempts,
+        })
+        this._scheduleReconnect()
+      }
     }
   }
 
@@ -107,6 +125,7 @@ export class CallEventsSocket {
     this._clearStuckTimer()
     this._stuckTimer = setTimeout(() => {
       console.warn('[Leadtodeed] WS stuck — no messages for', STUCK_TIMEOUT, 'ms, reconnecting')
+      this._reporter?.report('warn', 'call_events_ws_stuck', `no messages for ${STUCK_TIMEOUT}ms`)
       this._forceReconnect()
     }, STUCK_TIMEOUT)
   }
@@ -125,6 +144,14 @@ export class CallEventsSocket {
       RECONNECT_MAX_DELAY
     )
     this._reconnectAttempts += 1
+    // Tripwires: we keep retrying forever, but flag to backend so ops see
+    // "this widget has been trying to reconnect for a long time".
+    if (this._reconnectAttempts === 20 || this._reconnectAttempts === 100) {
+      this._reporter?.report('warn', 'call_events_ws_struggling', 'repeated reconnect attempts', {
+        attempts: this._reconnectAttempts,
+        next_delay_ms: delay,
+      })
+    }
     this._reconnectTimer = setTimeout(() => {
       if (!this._closedByUser) this._openSocket()
     }, delay)

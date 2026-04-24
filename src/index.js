@@ -22,6 +22,10 @@ import { LeadtodeedPhone } from './phone.js'
 import { createCallState, addEvent, transitionPhase } from './state.js'
 import { CallEventsSocket } from './call-events-ws.js'
 import { becomeLeader } from './leader.js'
+import { installActivityTracker, secondsSinceLastInput } from './activity.js'
+
+const HEARTBEAT_MS = 30_000
+const NEIGHBOR_PING_INTERVAL_MS = 30_000
 
 /**
  * Initialize the Leadtodeed phone library.
@@ -42,6 +46,9 @@ export default function Leadtodeed({
   onIncomingCall = null,
   ringtoneUrl = null,
   ringtonePlayer = null,
+  // Max telemetry reports per minute per tab. Default 600 (= 10/sec); set
+  // higher for deep debugging, lower if traffic to /api/client-log is hot.
+  telemetryRateLimit = undefined,
 } = {}) {
   const state = createCallState()
   const leadtodeedUrl = `https://${subdomain}.leadtodeed.ai`
@@ -59,6 +66,7 @@ export default function Leadtodeed({
   const phone = new LeadtodeedPhone({
     subdomain,
     tokenUrl,
+    telemetryRateLimit,
     onError: (err) => console.error("[Leadtodeed]", err),
   })
 
@@ -108,10 +116,17 @@ export default function Leadtodeed({
   function _connectCallEventsWS() {
     const token = phone._auth?.token
     if (!token) return
+    // Avoid leaking orphan CallEventsSockets on every SIP re-register. If
+    // one exists, tear it down cleanly before opening the new one.
+    if (callEventsSocket) {
+      try { callEventsSocket.disconnect() } catch { /* ignore */ }
+      callEventsSocket = null
+    }
     const wsUrl = leadtodeedUrl.replace('https://', 'wss://') + '/api/call/events'
     callEventsSocket = new CallEventsSocket({
       url: wsUrl,
       token,
+      reporter: phone.reporter,
       onParticipantJoined: (data) => {
         state.participants = [...state.participants.filter(p => p.user_id !== data.user_id), {
           user_id: data.user_id,
@@ -127,6 +142,23 @@ export default function Leadtodeed({
       },
       onCallEnded: () => {
         // The bridge ended server-side; let the normal SIP callEnded handle phase transition
+      },
+      onRefresh: (data) => {
+        // Server (admin) asked every widget tied to this ext to reload. Log
+        // what we're about to do, then reload — but never drop a live call.
+        phone.reporter.report('warn', 'got_refresh', data?.reason || '', {
+          in_call: phone.isInCall,
+          triggered_at: data?.triggered_at || null,
+        })
+        const doReload = () => {
+          try { location.reload() } catch { /* ignore */ }
+        }
+        if (phone.isInCall) {
+          // Deferred path — reload fires once the current call ends.
+          phone.on('callEnded', doReload)
+        } else {
+          doReload()
+        }
       },
     })
     callEventsSocket.connect()
@@ -205,14 +237,49 @@ export default function Leadtodeed({
     notify()
   })
 
-  // BroadcastChannel for cross-tab sync
+  // BroadcastChannel for cross-tab sync, wrapped with telemetry logging and
+  // a neighbor-count protocol (`bc_hello` / `bc_hello_ack`) that lets the
+  // heartbeat know how many other same-origin tabs of this widget exist.
   let channel = null
+  const neighborSessions = new Set()    // session_ids of other tabs we've heard from
+  let lastNeighborPingAt = 0
+
+  function _sendBC(msg) {
+    if (!channel) return
+    try {
+      channel.postMessage(msg)
+      phone.reporter.report('info', 'bc_sent', '', {
+        msg_type: msg?.type || 'unknown',
+      })
+    } catch { /* ignore */ }
+  }
+
   try {
     channel = new BroadcastChannel('leadtodeed-call')
     channel.onmessage = (e) => {
-      const msg = e.data
+      const msg = e.data || {}
+      phone.reporter.report('info', 'bc_received', '', {
+        msg_type: msg.type || 'unknown',
+        neighbor_session_id: msg.session_id || null,
+      })
+      // Track neighbors by session_id; evict stale entries in heartbeat.
+      if (msg.session_id && msg.session_id !== phone.sessionId) {
+        neighborSessions.add(msg.session_id)
+      }
       if (msg.type === 'request-state' && state.phase !== 'idle') {
-        channel.postMessage({ type: 'state', phase: state.phase, number: state.number, direction: state.direction, connectedAt: state.connectedAt, events: state.events })
+        _sendBC({
+          type: 'state',
+          session_id: phone.sessionId,
+          phase: state.phase,
+          number: state.number,
+          direction: state.direction,
+          connectedAt: state.connectedAt,
+          events: state.events,
+        })
+      }
+      // Respond to hello with our own session_id so counting converges.
+      if (msg.type === 'bc_hello' && msg.session_id !== phone.sessionId) {
+        _sendBC({ type: 'bc_hello_ack', session_id: phone.sessionId })
       }
     }
   } catch {
@@ -225,7 +292,10 @@ export default function Leadtodeed({
   // The Homey controller already broadcasts state and relays user actions; the
   // follower tab's local state simply stays idle (no phone events fire) and the
   // controller's _isRemoteRender path renders state pushed by the leader.
+  let isLeader = false
   const releaseLock = becomeLeader('leadtodeed-sip', async () => {
+    isLeader = true
+    phone.reporter.report('info', 'leader_acquired')
     try {
       await phone.connect()
     } catch (err) {
@@ -238,7 +308,89 @@ export default function Leadtodeed({
   const originalDisconnect = phone.disconnect.bind(phone)
   phone.disconnect = () => {
     originalDisconnect()
+    if (isLeader) {
+      isLeader = false
+      phone.reporter.report('info', 'leader_released')
+    }
     releaseLock()
+  }
+
+  // -----------------------------------------------------------------------
+  // Telemetry orchestration
+  // -----------------------------------------------------------------------
+  // Fires session_start now, heartbeats every 30s, visibility_change on
+  // foreground/background, bc_hello periodically to count neighbor tabs,
+  // and session_end via keepalive-fetch on pagehide.
+  //
+  // All events carry the stable session_id via the Reporter; via_host is
+  // populated by phone.js as soon as SIP connects, so heartbeats after the
+  // first ~second include it.
+
+  installActivityTracker()
+
+  phone.reporter.report('info', 'session_start', '', {
+    is_leader: isLeader,
+    is_visible: typeof document !== 'undefined' ? document.visibilityState === 'visible' : null,
+    has_focus: typeof document !== 'undefined' ? document.hasFocus() : null,
+    ua: typeof navigator !== 'undefined' ? (navigator.userAgent || '').slice(0, 200) : '',
+  })
+
+  // Ping neighbors so we can count them on the next heartbeat.
+  _sendBC({ type: 'bc_hello', session_id: phone.sessionId })
+  lastNeighborPingAt = Date.now()
+
+  const _heartbeat = () => {
+    // Re-ping neighbors periodically and evict entries that haven't
+    // responded within the ping interval. Prevents stale session_ids from
+    // inflating the count forever.
+    if (Date.now() - lastNeighborPingAt > NEIGHBOR_PING_INTERVAL_MS) {
+      neighborSessions.clear()
+      _sendBC({ type: 'bc_hello', session_id: phone.sessionId })
+      lastNeighborPingAt = Date.now()
+    }
+
+    phone.reporter.report('info', 'heartbeat', '', {
+      is_leader: isLeader,
+      is_visible: typeof document !== 'undefined' ? document.visibilityState === 'visible' : null,
+      has_focus: typeof document !== 'undefined' ? document.hasFocus() : null,
+      sip_registered: phone.isRegistered,
+      seconds_since_last_input: secondsSinceLastInput(),
+      neighbor_tabs: neighborSessions.size,
+    })
+  }
+  const _heartbeatTimer = setInterval(_heartbeat, HEARTBEAT_MS)
+
+  // Visibility / focus transitions — tiny events, mostly useful for
+  // correlating WS flaps against "tab went background 4 seconds earlier".
+  const _visHandler = () => {
+    phone.reporter.report('info', 'visibility_change', '', {
+      new_state: document.visibilityState,
+    })
+  }
+  const _focusHandler = () => {
+    phone.reporter.report('info', 'focus_change', '', { has_focus: true })
+  }
+  const _blurHandler = () => {
+    phone.reporter.report('info', 'focus_change', '', { has_focus: false })
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', _visHandler)
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('focus', _focusHandler)
+    window.addEventListener('blur', _blurHandler)
+  }
+
+  // Final ping on page unload. `pagehide` is the reliable choice per MDN
+  // (beforeunload is flaky on mobile / bfcache). keepalive: true on the
+  // underlying fetch lets the POST finish even as the page is unloading.
+  const _unloadHandler = (e) => {
+    phone.reporter.report('warn', 'session_end', '', {
+      reason: e?.persisted ? 'bfcache' : 'unload',
+    })
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('pagehide', _unloadHandler)
   }
 
   return phone

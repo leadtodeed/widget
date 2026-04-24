@@ -136,13 +136,13 @@ function patchJsSipGrammar() {
 }
 
 export class SipClient {
-  constructor({ onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected }) {
+  constructor({ onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected, onWsOpened }) {
     this._ua = null
     this._currentSession = null
     this._remoteAudio = null
     this._iceServers = []
     this._sipConfig = null
-    this._callbacks = { onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected }
+    this._callbacks = { onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected, onWsOpened }
   }
 
   get isRegistered() {
@@ -151,6 +151,16 @@ export class SipClient {
 
   get currentSession() {
     return this._currentSession
+  }
+
+  /**
+   * JsSIP's random `<token>.invalid` used as Via host — stable for this UA's
+   * life. Matches the `x-ast-orig-host=<token>.invalid` parameter in the
+   * contact URI that Asterisk stores per-AOR, so it's the join key between
+   * widget-side telemetry and server-side AOR state.
+   */
+  get viaHost() {
+    return this._ua?.configuration?.via_host || null
   }
 
   connect(sipConfig, iceServers) {
@@ -175,11 +185,27 @@ export class SipClient {
     }
 
     this._ua = new JsSIP.UA(configuration)
+    this._wsOpenedAt = null
 
+    this._ua.on('connected', () => {
+      this._wsOpenedAt = Date.now()
+      this._callbacks.onWsOpened?.()
+    })
     this._ua.on('registered', () => this._callbacks.onRegistered?.())
     this._ua.on('unregistered', () => this._callbacks.onUnregistered?.())
     this._ua.on('registrationFailed', (e) => this._callbacks.onRegistrationFailed?.(e))
-    this._ua.on('disconnected', () => this._callbacks.onDisconnected?.())
+    this._ua.on('disconnected', (e) => {
+      // `disconnected` fires with a reason/code object on abrupt closes.
+      // Pass through so callers can report code/reason/duration.
+      const durationMs = this._wsOpenedAt ? (Date.now() - this._wsOpenedAt) : null
+      this._wsOpenedAt = null
+      this._callbacks.onDisconnected?.({
+        code: e?.code ?? null,
+        reason: e?.reason ?? null,
+        was_clean: typeof e?.wasClean === 'boolean' ? e.wasClean : null,
+        duration_ms: durationMs,
+      })
+    })
     this._ua.on('newRTCSession', (e) => this._handleNewSession(e))
 
     this._ua.start()
