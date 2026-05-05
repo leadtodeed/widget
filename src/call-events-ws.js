@@ -18,12 +18,12 @@ const RECONNECT_BASE_DELAY = 1_000  // 1s
 const RECONNECT_MAX_DELAY = 30_000  // 30s cap
 
 export class CallEventsSocket {
-  constructor({ url, token, reporter, onParticipantJoined, onParticipantLeft, onCallEnded, onRefresh }) {
+  constructor({ url, token, reporter, onParticipantJoined, onParticipantLeft, onParticipantInviteFailed, onCallEnded, onRefresh }) {
     this._url = url
     this._token = token
     this._reporter = reporter
     this._ws = null
-    this._callbacks = { onParticipantJoined, onParticipantLeft, onCallEnded, onRefresh }
+    this._callbacks = { onParticipantJoined, onParticipantLeft, onParticipantInviteFailed, onCallEnded, onRefresh }
     this._closedByUser = false
     this._reconnectAttempts = 0
     this._heartbeatTimer = null
@@ -71,6 +71,13 @@ export class CallEventsSocket {
             break
           case 'participant_left':
             this._callbacks.onParticipantLeft?.(data)
+            break
+          case 'participant_invite_failed':
+            // Single dedicated event for "invite resolved without a join" —
+            // covers both timeout and explicit cancel from the inviter.
+            // Replaces the legacy participant_joined+participant_left
+            // synthetic pair the missed-timeout path used to emit.
+            this._callbacks.onParticipantInviteFailed?.(data)
             break
           case 'call_ended':
             this._callbacks.onCallEnded?.(data)

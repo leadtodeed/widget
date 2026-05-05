@@ -87,6 +87,7 @@ export default function Leadtodeed({
       sendDTMF: (digit) => phone.sendDTMF(digit),
       toggleMute: () => phone.toggleMute(),
       addParticipant: (userId, opts) => _addParticipant(userId, opts),
+      cancelInvite: (userId) => _cancelInvite(userId),
     })
   }
 
@@ -110,6 +111,31 @@ export default function Leadtodeed({
       }
     } catch (e) {
       console.error('[Leadtodeed] addParticipant error:', e)
+    }
+  }
+
+  // Cancel a still-pending conference invite this user just issued.
+  // Server is idempotent — a cancel that arrives when no pending invite
+  // exists (already joined / already missed / never sent / double-click)
+  // is a 200 noop, so the FE doesn't have to reconcile state. UI removal
+  // is optimistic and happens in the controller before this fires.
+  async function _cancelInvite(userId) {
+    const token = phone._auth?.token
+    if (!token) return
+    try {
+      const resp = await fetch(`${leadtodeedUrl}/api/conference/cancel`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ target_user_id: userId }),
+      })
+      if (!resp.ok) {
+        console.error('[Leadtodeed] cancelInvite failed:', resp.status)
+      }
+    } catch (e) {
+      console.error('[Leadtodeed] cancelInvite error:', e)
     }
   }
 
@@ -137,6 +163,15 @@ export default function Leadtodeed({
         notify()
       },
       onParticipantLeft: (data) => {
+        state.participants = state.participants.filter(p => p.user_id !== data.user_id)
+        notify()
+      },
+      onParticipantInviteFailed: (data) => {
+        // Invite resolved without a join (timeout or cancellation). The
+        // invitee was never in `participants` — they were a "Connecting…"
+        // placeholder in the controller's _pendingParticipants. Clear
+        // both to be defensive: if the controller already removed it
+        // (optimistic on cancel click), the filters below are no-ops.
         state.participants = state.participants.filter(p => p.user_id !== data.user_id)
         notify()
       },
@@ -244,13 +279,33 @@ export default function Leadtodeed({
   const neighborSessions = new Set()    // session_ids of other tabs we've heard from
   let lastNeighborPingAt = 0
 
+  // Extract safe, debuggable fields from a BroadcastChannel message for the
+  // telemetry sidecar. Picks ONLY non-PII fields — specifically excludes the
+  // `number` and `events` fields of state messages, which carry phone numbers
+  // and transcript data. Action messages get the `action` subtype + `digit`
+  // (DTMF key, already in Asterisk logs).
+  function _bcContext(msg) {
+    if (!msg || typeof msg !== 'object') return { msg_type: 'unknown' }
+    const ctx = { msg_type: msg.type || 'unknown' }
+    if (msg.session_id && msg.session_id !== phone.sessionId) {
+      ctx.neighbor_session_id = msg.session_id
+    }
+    if (msg.type === 'action') {
+      if (msg.action) ctx.action = String(msg.action).slice(0, 40)
+      if (msg.action === 'sendDTMF' && msg.digit) ctx.digit = String(msg.digit).slice(0, 4)
+    } else if (msg.type === 'state') {
+      if (msg.phase) ctx.phase = String(msg.phase).slice(0, 40)
+      if (msg.direction) ctx.direction = String(msg.direction).slice(0, 20)
+      // Explicitly NOT: msg.number, msg.events — those carry PII / transcript.
+    }
+    return ctx
+  }
+
   function _sendBC(msg) {
     if (!channel) return
     try {
       channel.postMessage(msg)
-      phone.reporter.report('info', 'bc_sent', '', {
-        msg_type: msg?.type || 'unknown',
-      })
+      phone.reporter.report('info', 'bc_sent', '', _bcContext(msg))
     } catch { /* ignore */ }
   }
 
@@ -258,10 +313,7 @@ export default function Leadtodeed({
     channel = new BroadcastChannel('leadtodeed-call')
     channel.onmessage = (e) => {
       const msg = e.data || {}
-      phone.reporter.report('info', 'bc_received', '', {
-        msg_type: msg.type || 'unknown',
-        neighbor_session_id: msg.session_id || null,
-      })
+      phone.reporter.report('info', 'bc_received', '', _bcContext(msg))
       // Track neighbors by session_id; evict stale entries in heartbeat.
       if (msg.session_id && msg.session_id !== phone.sessionId) {
         neighborSessions.add(msg.session_id)
@@ -358,7 +410,7 @@ export default function Leadtodeed({
       neighbor_tabs: neighborSessions.size,
     })
   }
-  const _heartbeatTimer = setInterval(_heartbeat, HEARTBEAT_MS)
+  setInterval(_heartbeat, HEARTBEAT_MS)
 
   // Visibility / focus transitions — tiny events, mostly useful for
   // correlating WS flaps against "tab went background 4 seconds earlier".
