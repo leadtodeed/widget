@@ -17,7 +17,7 @@
  *   import { LeadtodeedPhone } from 'leadtodeed-widget'
  *
  *   const phone = new LeadtodeedPhone({
- *     subdomain: 'homey',
+ *     subdomain: 'acme',
  *     tokenUrl: '/api/leadtodeed/token',
  *   })
  *
@@ -200,6 +200,17 @@ export class LeadtodeedPhone extends EventEmitter {
 
   call(number) {
     if (!number) return
+    // Defense-in-depth against duplicate dial. SipClient sets _currentSession
+    // synchronously inside _ua.call(), so a back-to-back call() in the same
+    // tick still trips this. Host apps typically debounce too, but a second
+    // layer here means any caller bypassing them can't accidentally issue
+    // two INVITEs for one click.
+    if (this.isInCall) {
+      this._reporter.report('warn', 'duplicate_call_blocked', '', {
+        number: this._callNumber || null,
+      })
+      return
+    }
 
     this._callNumber = number.replace(/[^\d+]/g, '')
 

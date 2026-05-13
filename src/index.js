@@ -7,7 +7,7 @@
  * Usage (ESM via importmap / bundler):
  *   import Leadtodeed from 'leadtodeed-widget'
  *   Leadtodeed({
- *     subdomain: 'homey',
+ *     subdomain: 'acme',
  *     tokenUrl: '/api/leadtodeed/token',
  *     renderer: (state) => updateUI(state),
  *     onIncomingCall: async (number) => fetchCallerInfo(number),
@@ -15,7 +15,7 @@
  *
  * Usage (IIFE via CDN <script> tag):
  *   <script src="https://cdn.jsdelivr.net/npm/leadtodeed-widget@latest/dist/leadtodeed-widget.iife.js"></script>
- *   <script>Leadtodeed({ subdomain: 'homey', tokenUrl: '/api/leadtodeed/token', renderer: (s) => {} })</script>
+ *   <script>Leadtodeed({ subdomain: 'acme', tokenUrl: '/api/leadtodeed/token', renderer: (s) => {} })</script>
  */
 
 import { LeadtodeedPhone } from './phone.js'
@@ -31,7 +31,7 @@ const NEIGHBOR_PING_INTERVAL_MS = 30_000
  * Initialize the Leadtodeed phone library.
  *
  * @param {Object} config
- * @param {string} config.subdomain - Tenant subdomain (e.g. "homey" → https://homey.leadtodeed.ai)
+ * @param {string} config.subdomain - Tenant subdomain (e.g. "acme" → https://acme.leadtodeed.ai)
  * @param {string} config.tokenUrl - Token endpoint path
  * @param {Function} [config.renderer] - (state) => void — called on every state change
  * @param {Function} [config.onIncomingCall] - async (callerNumber) => enrichmentData | null
@@ -341,7 +341,7 @@ export default function Leadtodeed({
   // Tab leader election: only one tab connects to SIP + call-events at a time.
   // Followers stay passive until the leader's tab closes (browser releases the lock,
   // next waiter wins). Cross-tab UI sync continues via BroadcastChannel above.
-  // The Homey controller already broadcasts state and relays user actions; the
+  // The host controller already broadcasts state and relays user actions; the
   // follower tab's local state simply stays idle (no phone events fire) and the
   // controller's _isRemoteRender path renders state pushed by the leader.
   let isLeader = false

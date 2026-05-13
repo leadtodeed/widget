@@ -102,6 +102,18 @@ describe('LeadtodeedPhone', () => {
       expect(phone._sip.call).not.toHaveBeenCalled()
     })
 
+    it('blocks a second call() while a session is in flight', () => {
+      const phone = new LeadtodeedPhone(defaults)
+      // Simulate SipClient setting currentSession synchronously on first call,
+      // matching the real implementation (sip-client.js:244).
+      phone._sip.call.mockImplementation(() => {
+        phone._sip.currentSession = { id: 'session-1' }
+      })
+      phone.call('+1234567890')
+      phone.call('+1234567890')
+      expect(phone._sip.call).toHaveBeenCalledTimes(1)
+    })
+
     it('delegates hangup() to SipClient', () => {
       const phone = new LeadtodeedPhone(defaults)
       phone.hangup()
