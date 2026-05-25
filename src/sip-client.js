@@ -136,13 +136,36 @@ function patchJsSipGrammar() {
 }
 
 export class SipClient {
-  constructor({ onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected, onWsOpened }) {
+  constructor({ onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected, onWsOpened, getAudioConstraints }) {
     this._ua = null
     this._currentSession = null
     this._remoteAudio = null
     this._iceServers = []
     this._sipConfig = null
     this._callbacks = { onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected, onWsOpened }
+    // Host-supplied callback returning the `audio` value for getUserMedia /
+    // JsSIP mediaConstraints — typically `{ deviceId: { exact: '<id>' } }`
+    // when the user has picked a specific microphone, or undefined to fall
+    // back to the browser default. Called fresh at every call()/answer() so
+    // a localStorage change takes effect on the next call.
+    this._getAudioConstraints = typeof getAudioConstraints === 'function' ? getAudioConstraints : null
+  }
+
+  /**
+   * Resolve the `audio` constraint for getUserMedia. Returns either an object
+   * (when the host has nominated a specific device) or `true` (browser default).
+   * The host callback is allowed to throw / return nullish — we fall back to
+   * default audio so a busted picker never blocks a call.
+   */
+  _audioConstraint() {
+    if (!this._getAudioConstraints) return true
+    try {
+      const c = this._getAudioConstraints()
+      if (c && typeof c === 'object' && Object.keys(c).length) return c
+    } catch {
+      /* host picker threw — fall back to default device */
+    }
+    return true
   }
 
   get isRegistered() {
@@ -229,7 +252,7 @@ export class SipClient {
     }
 
     const options = {
-      mediaConstraints: { audio: true, video: false },
+      mediaConstraints: { audio: this._audioConstraint(), video: false },
       pcConfig: {
         iceServers: this._iceServers,
         iceCandidatePoolSize: 10,
@@ -257,7 +280,7 @@ export class SipClient {
     if (!this._currentSession) return
 
     const options = {
-      mediaConstraints: { audio: true, video: false },
+      mediaConstraints: { audio: this._audioConstraint(), video: false },
       pcConfig: {
         iceServers: this._iceServers,
         iceCandidatePoolSize: 10,
@@ -266,6 +289,63 @@ export class SipClient {
     }
 
     this._currentSession.answer(options)
+  }
+
+  /**
+   * Live-switch the microphone used by the current SIP session, if any. Pulls
+   * a new MediaStream from getUserMedia and swaps it into the audio sender
+   * via replaceTrack() — the call's signalling/SDP is untouched, only the
+   * upstream track changes.
+   *
+   * Returns `true` if the swap succeeded, `false` if there's no active session,
+   * no audio sender, or getUserMedia rejected (e.g. device disappeared).
+   *
+   * JsSIP 3.x mute operates on `sender.track.enabled`, so subsequent
+   * mute()/unmute() calls continue to work after the swap without touching
+   * `session._localMediaStream`. Mute state is preserved by mirroring the
+   * old track's `enabled` flag onto the new track before replaceTrack.
+   *
+   * `deviceId` may be falsy/'default' — that yields `{ audio: true }` and lets
+   * the browser pick its current default device.
+   */
+  async setMicrophone(deviceId) {
+    if (!this._currentSession || !this._currentSession.connection) return false
+    const pc = this._currentSession.connection
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio')
+    if (!sender) return false
+
+    const audioConstraint = deviceId && deviceId !== 'default'
+      ? { deviceId: { exact: deviceId } }
+      : true
+    let stream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint, video: false })
+    } catch {
+      return false
+    }
+    const newTrack = stream.getAudioTracks()[0]
+    if (!newTrack) return false
+
+    const oldTrack = sender.track
+    // Preserve mute: enabled=false on the old track means the user had
+    // muted; the new track must come up in the same state or the swap
+    // would silently un-mute mid-call.
+    if (oldTrack) newTrack.enabled = oldTrack.enabled
+
+    try {
+      await sender.replaceTrack(newTrack)
+    } catch {
+      // Roll back: stop the unused new track so the mic indicator goes away.
+      try { newTrack.stop() } catch { /* ignore */ }
+      return false
+    }
+
+    // Release the previous mic so the OS indicator clears and the device
+    // can be picked up by another tab/app.
+    if (oldTrack && oldTrack !== newTrack) {
+      try { oldTrack.stop() } catch { /* ignore */ }
+    }
+    return true
   }
 
   reject() {

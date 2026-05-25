@@ -37,6 +37,7 @@ const NEIGHBOR_PING_INTERVAL_MS = 30_000
  * @param {Function} [config.onIncomingCall] - async (callerNumber) => enrichmentData | null
  * @param {string} [config.ringtoneUrl] - URL to an .ogg ringtone played on incoming calls
  * @param {{play: Function, stop: Function}} [config.ringtonePlayer] - Custom ringtone player (overrides ringtoneUrl). Use to play via AudioContext so macOS doesn't show Now Playing.
+ * @param {Function} [config.getAudioConstraints] - () => audio getUserMedia constraint (typically `{ deviceId: { exact: '<id>' } }`). Called fresh on every call()/answer() so a host-side mic-picker change applies to the next call. Return nullish to use the browser default.
  * @returns {LeadtodeedPhone} The phone instance
  */
 export default function Leadtodeed({
@@ -49,6 +50,7 @@ export default function Leadtodeed({
   // Max telemetry reports per minute per tab. Default 600 (= 10/sec); set
   // higher for deep debugging, lower if traffic to /api/client-log is hot.
   telemetryRateLimit = undefined,
+  getAudioConstraints = null,
 } = {}) {
   const state = createCallState()
   const leadtodeedUrl = `https://${subdomain}.leadtodeed.ai`
@@ -67,6 +69,7 @@ export default function Leadtodeed({
     subdomain,
     tokenUrl,
     telemetryRateLimit,
+    getAudioConstraints,
     onError: (err) => console.error("[Leadtodeed]", err),
   })
 
@@ -88,6 +91,10 @@ export default function Leadtodeed({
       toggleMute: () => phone.toggleMute(),
       addParticipant: (userId, opts) => _addParticipant(userId, opts),
       cancelInvite: (userId) => _cancelInvite(userId),
+      // Live-switch the input device on the active call. No-op when idle —
+      // the host should still persist the choice and `getAudioConstraints`
+      // will pick it up on the next call/answer.
+      setMicrophone: (deviceId) => phone.setMicrophone(deviceId),
     })
   }
 

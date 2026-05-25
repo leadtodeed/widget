@@ -59,6 +59,7 @@ export class LeadtodeedPhone extends EventEmitter {
     tokenUrl,
     sessionId,
     telemetryRateLimit,
+    getAudioConstraints,
     onRegistered,
     onCallStarted,
     onCallEnded,
@@ -99,6 +100,7 @@ export class LeadtodeedPhone extends EventEmitter {
     this._registerCount = 0
 
     this._sip = new SipClient({
+      getAudioConstraints,
       onWsOpened: () => {
         // First opportunity where sip._ua.configuration.via_host is populated.
         // Publish it into the reporter so ALL subsequent events — including
@@ -254,6 +256,18 @@ export class LeadtodeedPhone extends EventEmitter {
     } else {
       this.mute()
     }
+  }
+
+  /**
+   * Switch the input microphone for the active call. No-op if there's no
+   * call in progress — the next call/answer will pick up whichever device
+   * the host's `getAudioConstraints` callback returns at that point.
+   *
+   * Returns the boolean result from SipClient so callers can flash an
+   * error UI when the swap fails (device unplugged, permission revoked).
+   */
+  setMicrophone(deviceId) {
+    return this._sip.setMicrophone(deviceId)
   }
 
   get isMuted() {
