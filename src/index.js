@@ -98,22 +98,9 @@ export default function Leadtodeed({
     })
   }
 
-  // Returns true iff the invite POST was accepted by the server. The token
-  // only exists on the tab that ran connect() — i.e. the SIP leader. A
-  // follower tab has no token; the controller is responsible for relaying the
-  // click to the leader instead of calling this here. If we reach the
-  // no-token branch the relay was bypassed, so we surface it (warn) rather
-  // than silently dropping the click — that silent drop is exactly the bug
-  // that left invitees un-rung while the UI showed "Connecting…".
   async function _addParticipant(userId, opts) {
     const token = phone._auth?.token
-    if (!token) {
-      phone.reporter?.report('warn', 'conference_add_no_token', '', {
-        target_user_id: userId,
-        has_phone: !!opts?.phone,
-      })
-      return false
-    }
+    if (!token) return
     try {
       const body = { target_user_id: userId }
       if (opts?.phone) body.target_user_phone = opts.phone
@@ -126,22 +113,11 @@ export default function Leadtodeed({
         },
         body: JSON.stringify(body),
       })
-      phone.reporter?.report(resp.ok ? 'info' : 'warn', 'conference_add', '', {
-        target_user_id: userId,
-        has_phone: !!opts?.phone,
-        status: resp.status,
-        ok: resp.ok,
-      })
       if (!resp.ok) {
         console.error('[Leadtodeed] addParticipant failed:', resp.status)
       }
-      return resp.ok
     } catch (e) {
-      phone.reporter?.report('warn', 'conference_add_error', String(e), {
-        target_user_id: userId,
-      })
       console.error('[Leadtodeed] addParticipant error:', e)
-      return false
     }
   }
 
@@ -152,12 +128,7 @@ export default function Leadtodeed({
   // is optimistic and happens in the controller before this fires.
   async function _cancelInvite(userId) {
     const token = phone._auth?.token
-    if (!token) {
-      phone.reporter?.report('warn', 'conference_cancel_no_token', '', {
-        target_user_id: userId,
-      })
-      return false
-    }
+    if (!token) return
     try {
       const resp = await fetch(`${leadtodeedUrl}/api/conference/cancel`, {
         method: 'POST',
@@ -167,21 +138,11 @@ export default function Leadtodeed({
         },
         body: JSON.stringify({ target_user_id: userId }),
       })
-      phone.reporter?.report(resp.ok ? 'info' : 'warn', 'conference_cancel', '', {
-        target_user_id: userId,
-        status: resp.status,
-        ok: resp.ok,
-      })
       if (!resp.ok) {
         console.error('[Leadtodeed] cancelInvite failed:', resp.status)
       }
-      return resp.ok
     } catch (e) {
-      phone.reporter?.report('warn', 'conference_cancel_error', String(e), {
-        target_user_id: userId,
-      })
       console.error('[Leadtodeed] cancelInvite error:', e)
-      return false
     }
   }
 
@@ -316,13 +277,6 @@ export default function Leadtodeed({
   phone.on('event', (event) => {
     state.events.push(event)
     notify()
-  })
-
-  // Forward WebRTC quality samples to the backend over the call-events WS (the
-  // leader holds both the RTCPeerConnection and this socket). Backend tags them
-  // with subdomain/extension/call_uuid and exposes them to Prometheus.
-  phone.on('stats', (msg) => {
-    try { callEventsSocket?.send(msg) } catch { /* best-effort telemetry */ }
   })
 
   // BroadcastChannel for cross-tab sync, wrapped with telemetry logging and

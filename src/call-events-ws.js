@@ -47,15 +47,6 @@ export class CallEventsSocket {
     }
   }
 
-  // Best-effort send of a JSON message to the backend. Used for client→server
-  // telemetry (e.g. WebRTC quality stats). Silently drops if the socket isn't
-  // open — samples are periodic, so a missed one is harmless.
-  send(obj) {
-    if (this._ws && this._ws.readyState === WebSocket.OPEN) {
-      try { this._ws.send(JSON.stringify(obj)) } catch { /* will surface via onclose */ }
-    }
-  }
-
   _openSocket() {
     // Pass JWT via Sec-WebSocket-Protocol ("bearer.<jwt>") instead of a query
     // string so the token never appears in URLs or access logs. Server echoes

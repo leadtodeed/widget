@@ -136,13 +136,13 @@ function patchJsSipGrammar() {
 }
 
 export class SipClient {
-  constructor({ onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected, onWsOpened, onStats, getAudioConstraints }) {
+  constructor({ onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected, onWsOpened, getAudioConstraints }) {
     this._ua = null
     this._currentSession = null
     this._remoteAudio = null
     this._iceServers = []
     this._sipConfig = null
-    this._callbacks = { onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected, onWsOpened, onStats }
+    this._callbacks = { onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected, onWsOpened }
     // Host-supplied callback returning the `audio` value for getUserMedia /
     // JsSIP mediaConstraints — typically `{ deviceId: { exact: '<id>' } }`
     // when the user has picked a specific microphone, or undefined to fall
@@ -194,10 +194,6 @@ export class SipClient {
 
     this._sipConfig = sipConfig
     this._iceServers = iceServers
-    // Ordered RTP codec names from the backend (e.g. ['opus','PCMU','PCMA']).
-    // Pinned per peer connection so this extension negotiates its assigned codec
-    // deterministically instead of relying on browser/Asterisk ordering.
-    this._audioCodecs = Array.isArray(sipConfig.audio_codecs) ? sipConfig.audio_codecs : []
 
     const socket = new JsSIP.WebSocketInterface(sipConfig.wss_url)
 
@@ -403,11 +399,6 @@ export class SipClient {
     session.on('sdp', (e) => {
       if (e.originator === 'remote') {
         e.sdp = e.sdp.replace(/a=recvonly/g, 'a=sendrecv')
-      } else if (e.originator === 'local') {
-        // Fallback to setCodecPreferences: reorder our outgoing m=audio payload
-        // list to match the backend codec preference, in case transceivers weren't
-        // available when _applyCodecPreferences ran.
-        e.sdp = this._reorderAudioCodecs(e.sdp)
       }
     })
 
@@ -420,74 +411,17 @@ export class SipClient {
     }
 
     session.on('ended', () => {
-      this._stopStatsSampler()
       this._destroyAudioElement()
       this._currentSession = null
     })
 
     session.on('failed', () => {
-      this._stopStatsSampler()
       this._destroyAudioElement()
       this._currentSession = null
     })
   }
 
-  _applyCodecPreferences(pc) {
-    // Pin codec negotiation order to this._audioCodecs (backend-driven) before
-    // the SDP offer/answer is generated. No-op if the browser lacks the API or
-    // transceivers aren't created yet (the session 'sdp' hook reorders as a fallback).
-    if (!this._audioCodecs?.length) return
-    if (typeof RTCRtpReceiver === 'undefined' || !RTCRtpReceiver.getCapabilities) return
-    if (typeof pc.getTransceivers !== 'function') return
-    const caps = RTCRtpReceiver.getCapabilities('audio')?.codecs
-    if (!caps?.length) return
-    const wanted = this._audioCodecs.map((n) => `audio/${n.toLowerCase()}`)
-    const ranked = wanted
-      .map((mime) => caps.filter((c) => c.mimeType.toLowerCase() === mime))
-      .flat()
-    if (!ranked.length) return
-    const rest = caps.filter((c) => !ranked.includes(c))
-    const ordered = [...ranked, ...rest]
-    for (const t of pc.getTransceivers()) {
-      const isAudio = t.sender?.track?.kind === 'audio' || t.receiver?.track?.kind === 'audio'
-      if (isAudio && typeof t.setCodecPreferences === 'function') {
-        try { t.setCodecPreferences(ordered) } catch { /* unsupported codec set; ignore */ }
-      }
-    }
-  }
-
-  _reorderAudioCodecs(sdp) {
-    // Reorder the first m=audio payload list so this._audioCodecs come first,
-    // preserving the rest. Used as a fallback when setCodecPreferences couldn't run.
-    if (!this._audioCodecs?.length) return sdp
-    const eol = sdp.includes('\r\n') ? '\r\n' : '\n'
-    const lines = sdp.split(/\r\n|\n/)
-    const mIdx = lines.findIndex((l) => l.startsWith('m=audio '))
-    if (mIdx === -1) return sdp
-    const ptName = {}
-    for (let i = mIdx + 1; i < lines.length; i++) {
-      if (lines[i].startsWith('m=')) break // next media section
-      const m = lines[i].match(/^a=rtpmap:(\d+)\s+([^/]+)\//i)
-      if (m) ptName[m[1]] = m[2].toLowerCase()
-    }
-    const parts = lines[mIdx].split(' ')
-    const header = parts.slice(0, 3) // 'm=audio', port, proto
-    const pts = parts.slice(3)
-    const wanted = this._audioCodecs.map((n) => n.toLowerCase())
-    const ranked = []
-    for (const w of wanted) {
-      for (const pt of pts) {
-        if (ptName[pt] === w && !ranked.includes(pt)) ranked.push(pt)
-      }
-    }
-    if (!ranked.length) return sdp
-    const rest = pts.filter((pt) => !ranked.includes(pt))
-    lines[mIdx] = [...header, ...ranked, ...rest].join(' ')
-    return lines.join(eol)
-  }
-
   _setupPeerConnection(pc) {
-    this._applyCodecPreferences(pc)
     pc.ontrack = (e) => {
       if (e.track.kind === 'audio') {
         this._ensureAudioElement()
@@ -499,75 +433,6 @@ export class SipClient {
         this._remoteAudio.play().catch(() => {})
       }
     }
-    this._startStatsSampler(pc)
-  }
-
-  // Poll getStats() every 3s and emit a compact quality sample (jitter, RTT,
-  // loss, concealment/freezes, mic + playout audio levels) via onStats. The
-  // backend tags it with subdomain/extension/call_uuid and feeds Prometheus.
-  // Stops itself when the connection closes; emits a terminal {type:'stats_end'}.
-  _startStatsSampler(pc) {
-    if (this._statsPc === pc) return   // _setupPeerConnection can fire twice for one pc
-    this._stopStatsSampler()
-    this._statsPc = pc
-    this._statsCallId = this._currentSession?.id || null
-    let prev = null
-
-    const sample = async () => {
-      let report
-      try { report = await pc.getStats() } catch { return }
-      let inbound, remoteInbound, source, pair
-      report.forEach((r) => {
-        if (r.type === 'inbound-rtp' && r.kind === 'audio') inbound = r
-        else if (r.type === 'remote-inbound-rtp' && r.kind === 'audio') remoteInbound = r
-        else if (r.type === 'media-source' && r.kind === 'audio') source = r
-        else if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || !pair)) pair = r
-      })
-      const m = {}
-      if (inbound) {
-        if (typeof inbound.jitter === 'number') m.jitter_recv = inbound.jitter
-        if (typeof inbound.audioLevel === 'number') m.level_playout = inbound.audioLevel
-        if (typeof inbound.freezeCount === 'number') m.freezes = inbound.freezeCount
-        if (inbound.totalSamplesReceived > 0 && typeof inbound.concealedSamples === 'number') {
-          m.concealment = inbound.concealedSamples / inbound.totalSamplesReceived
-        }
-        // packetsLost/Received are cumulative counters — diff to get a rate.
-        if (prev && typeof inbound.packetsReceived === 'number' && typeof inbound.packetsLost === 'number') {
-          const denom = (inbound.packetsReceived - prev.recv) + (inbound.packetsLost - prev.lost)
-          if (denom > 0) m.loss_recv = Math.max(0, (inbound.packetsLost - prev.lost) / denom)
-        }
-        prev = { recv: inbound.packetsReceived ?? 0, lost: inbound.packetsLost ?? 0 }
-      }
-      if (remoteInbound) {
-        if (typeof remoteInbound.jitter === 'number') m.jitter_send = remoteInbound.jitter
-        if (typeof remoteInbound.fractionLost === 'number') m.loss_send = remoteInbound.fractionLost
-        if (typeof remoteInbound.roundTripTime === 'number') m.rtt = remoteInbound.roundTripTime
-      }
-      if (source && typeof source.audioLevel === 'number') m.level_mic = source.audioLevel
-      if (m.rtt === undefined && pair && typeof pair.currentRoundTripTime === 'number') m.rtt = pair.currentRoundTripTime
-      if (Object.keys(m).length) {
-        this._callbacks.onStats?.({ type: 'stats', call_id: this._statsCallId, metrics: m })
-      }
-    }
-
-    this._statsTimer = setInterval(sample, 3000)
-    this._statsOnState = () => {
-      if (['closed', 'failed', 'disconnected'].includes(pc.connectionState)) this._stopStatsSampler()
-    }
-    pc.addEventListener?.('connectionstatechange', this._statsOnState)
-  }
-
-  _stopStatsSampler() {
-    if (this._statsTimer) { clearInterval(this._statsTimer); this._statsTimer = null }
-    if (this._statsPc && this._statsOnState) {
-      this._statsPc.removeEventListener?.('connectionstatechange', this._statsOnState)
-    }
-    if (this._statsCallId) {
-      this._callbacks.onStats?.({ type: 'stats_end', call_id: this._statsCallId })
-      this._statsCallId = null
-    }
-    this._statsPc = null
-    this._statsOnState = null
   }
 
   _ensureAudioElement() {
