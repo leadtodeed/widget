@@ -134,6 +134,7 @@ export class LeadtodeedPhone extends EventEmitter {
         this.emit('error', new Error(`SIP registration failed: ${e?.cause || 'unknown'}`))
       },
       onNewSession: (session, meta) => this._handleSession(session, meta),
+      onStats: (msg) => this.emit('stats', msg),
       onDisconnected: (e) => {
         this._registered = false
         this._reporter.report('warn', 'sip_ws_closed', e?.reason || '', {
