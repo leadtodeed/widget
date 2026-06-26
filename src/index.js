@@ -115,9 +115,15 @@ export default function Leadtodeed({
       })
       if (!resp.ok) {
         console.error('[Leadtodeed] addParticipant failed:', resp.status)
+        return { status: 'error' }
       }
+      // Return the server's outcome so the host can react. status is
+      // 'ringing' (normal) or 'busy' (target already on a call — the host
+      // shows "<name> is on a call" and drops the optimistic row).
+      return await resp.json().catch(() => ({}))
     } catch (e) {
       console.error('[Leadtodeed] addParticipant error:', e)
+      return { status: 'error' }
     }
   }
 
