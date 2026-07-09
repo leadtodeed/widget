@@ -37,6 +37,32 @@ import { AuthManager } from './auth.js'
 import { SipClient } from './sip-client.js'
 import { Reporter } from './reporter.js'
 
+// --- SIP registration watchdog ---
+//
+// With register_expires=60 the UA re-REGISTERs about once a minute, so the
+// age of the last successful REGISTER is a liveness probe for the whole SIP
+// path: socket + registration + server-side contact. After a tab suspension
+// (Safari suspends background tabs wholesale; laptop sleep suspends
+// everything) the WebSocket can be a zombie — readyState OPEN while the
+// server reaped the contact long ago. JsSIP only discovers that when its
+// next REGISTER times out (Timer F, 32s) — longer than a typical Safari
+// resume burst — so its built-in recovery can straggle across hours of
+// suspend/resume cycles while the extension is unreachable. The watchdog
+// short-circuits that: on any wake-up signal (overdue interval tick,
+// visibilitychange→visible, pageshow) it checks registration age and, if
+// stale, hard-restarts the transport — done in well under a second, i.e.
+// within a single awake window.
+const WATCHDOG_INTERVAL_MS = 15_000
+// A tick arriving this late means the page was suspended. Chrome throttles
+// hidden-tab timers to 1/min, so the threshold sits safely above that.
+const WATCHDOG_SUSPEND_GAP_MS = 120_000
+// ≥2 missed REGISTER refreshes at register_expires=60.
+const REGISTRATION_STALE_MS = 150_000
+// Backoff between restarts that fail to bring the registration back — reset
+// by the next successful REGISTER.
+const WATCHDOG_RESTART_BASE_MS = 30_000
+const WATCHDOG_RESTART_MAX_MS = 300_000
+
 // Generate a random session identifier. Prefer crypto.randomUUID when
 // available (all evergreen browsers + HTTPS contexts); otherwise fall back
 // to a non-cryptographic 16-char token — session_id is just a correlation
@@ -88,6 +114,19 @@ export class LeadtodeedPhone extends EventEmitter {
     this._bridgeId = null
     this._isConference = false
 
+    // Watchdog state (see constants at the top of this file)
+    this._lastRegisteredAt = null
+    this._watchdogTimer = null
+    this._watchdogVisHandler = null
+    this._watchdogPageshowHandler = null
+    this._watchdogLastTickAt = 0
+    this._watchdogLastRestartAt = 0
+    this._watchdogRestartCount = 0
+    this._watchdogRestarting = false
+    // Bumped by every disconnect() so an in-flight watchdog restart can tell
+    // that teardown won the race and must not leave a fresh UA behind.
+    this._disconnectEpoch = 0
+
     // Wire up callbacks
     if (onRegistered) this.on('registered', onRegistered)
     if (onCallStarted) this.on('callStarted', onCallStarted)
@@ -111,6 +150,8 @@ export class LeadtodeedPhone extends EventEmitter {
       },
       onRegistered: () => {
         this._registered = true
+        this._lastRegisteredAt = Date.now()
+        this._watchdogRestartCount = 0
         this._registerCount += 1
         if (this._registerCount === 1) {
           this._reporter.report('info', 'register_success', '', {
@@ -188,6 +229,7 @@ export class LeadtodeedPhone extends EventEmitter {
       await this._auth.fetchToken()
       const config = await this._auth.fetchSipConfig(this._leadtodeedUrl)
       this._sip.connect(config.sip, config.ice_servers)
+      this._startWatchdog()
     } catch (e) {
       this.emit('error', e)
       throw e
@@ -195,9 +237,107 @@ export class LeadtodeedPhone extends EventEmitter {
   }
 
   disconnect() {
+    this._disconnectEpoch += 1
+    this._stopWatchdog()
     this._sip.disconnect()
     this._auth.destroy()
     this._registered = false
+  }
+
+  // --- SIP registration watchdog (see constants at the top of this file) ---
+
+  _startWatchdog() {
+    if (this._watchdogTimer) return
+    this._watchdogLastTickAt = Date.now()
+    this._watchdogTimer = setInterval(() => {
+      const now = Date.now()
+      const gap = now - this._watchdogLastTickAt
+      this._watchdogLastTickAt = now
+      // An overdue tick is itself the resume signal: suspended pages fire
+      // their missed interval once, immediately on resume.
+      this._watchdogCheck(gap > WATCHDOG_SUSPEND_GAP_MS ? 'resume' : 'interval')
+    }, WATCHDOG_INTERVAL_MS)
+    if (typeof document !== 'undefined') {
+      this._watchdogVisHandler = () => {
+        if (document.visibilityState === 'visible') this._watchdogCheck('visible')
+      }
+      document.addEventListener('visibilitychange', this._watchdogVisHandler)
+    }
+    if (typeof window !== 'undefined') {
+      this._watchdogPageshowHandler = () => this._watchdogCheck('pageshow')
+      window.addEventListener('pageshow', this._watchdogPageshowHandler)
+    }
+  }
+
+  _stopWatchdog() {
+    if (this._watchdogTimer) {
+      clearInterval(this._watchdogTimer)
+      this._watchdogTimer = null
+    }
+    if (this._watchdogVisHandler) {
+      document.removeEventListener('visibilitychange', this._watchdogVisHandler)
+      this._watchdogVisHandler = null
+    }
+    if (this._watchdogPageshowHandler) {
+      window.removeEventListener('pageshow', this._watchdogPageshowHandler)
+      this._watchdogPageshowHandler = null
+    }
+  }
+
+  _watchdogCheck(reason) {
+    if (!this._watchdogTimer || this._watchdogRestarting) return
+    // A live session means the media path is up (the zombie scenario cannot
+    // coexist with flowing RTP) — and restarting the UA would kill the call.
+    if (this.isInCall) return
+    // Until the first REGISTER succeeds, initial-connect failures are
+    // JsSIP's to retry; restarting here would loop on bad credentials.
+    if (this._lastRegisteredAt === null) return
+    const registeredAgoMs = Date.now() - this._lastRegisteredAt
+    if (registeredAgoMs < REGISTRATION_STALE_MS) return
+    // No network at all (fresh wake from sleep) — cycling the transport now
+    // just burns the backoff budget; the next tick retries once online.
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return
+    const cooldown = Math.min(
+      WATCHDOG_RESTART_BASE_MS * 2 ** this._watchdogRestartCount,
+      WATCHDOG_RESTART_MAX_MS
+    )
+    if (Date.now() - this._watchdogLastRestartAt < cooldown) return
+    this._watchdogLastRestartAt = Date.now()
+    this._watchdogRestartCount += 1
+    this._reporter.report('warn', 'sip_watchdog_stale', reason, {
+      registered_ago_ms: registeredAgoMs,
+      // JsSIP's belief — expected to be a stale `true` in the zombie case.
+      registered: this._registered,
+      restart_count: this._watchdogRestartCount,
+    })
+    this._watchdogRestart()
+  }
+
+  async _watchdogRestart() {
+    this._watchdogRestarting = true
+    const epoch = this._disconnectEpoch
+    try {
+      // Hard-drop the (possibly zombie) socket instead of waiting for JsSIP
+      // to time out on it, then rebuild from scratch: fresh token, fresh
+      // config, fresh WebSocket, fresh REGISTER. Recovery shows up in
+      // telemetry as the usual sip_ws_opened + sip_register_refresh, and the
+      // 'registered' handler resets the restart backoff.
+      this._sip.disconnect()
+      await this.connect()
+      if (this._disconnectEpoch !== epoch) {
+        // disconnect() was called while we were reconnecting (page teardown,
+        // leadership release) — honour it instead of leaving a fresh UA
+        // registered on a tab that gave up its SIP role.
+        this._stopWatchdog()
+        this._sip.disconnect()
+      }
+    } catch (e) {
+      this._reporter.report('error', 'sip_watchdog_restart_failed', e?.message || 'unknown', {
+        restart_count: this._watchdogRestartCount,
+      })
+    } finally {
+      this._watchdogRestarting = false
+    }
   }
 
   call(number) {
