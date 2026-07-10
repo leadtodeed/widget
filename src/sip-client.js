@@ -186,7 +186,10 @@ export class SipClient {
     return this._ua?.configuration?.via_host || null
   }
 
-  connect(sipConfig, iceServers) {
+  // `register: false` connects the WebSocket without REGISTERing — used by a
+  // leadership candidate warming up its transport; register() completes the
+  // takeover later.
+  connect(sipConfig, iceServers, { register = true } = {}) {
     // Apply patches once
     patchIceGathering()
     patchSdpRemoteDescription()
@@ -202,7 +205,7 @@ export class SipClient {
       uri: `sip:${sipConfig.extension}@${sipConfig.sip_domain}`,
       password: sipConfig.sip_password,
       display_name: sipConfig.display_name,
-      register: true,
+      register,
       register_expires: 60,
       session_timers: false,
     }
@@ -244,6 +247,13 @@ export class SipClient {
       this._ua.stop()
       this._ua = null
     }
+  }
+
+  /** REGISTER on the already-connected UA (candidate takeover after a
+   *  connect({register: false}) warm-up). JsSIP keeps auto-refreshing after
+   *  a manual register(), same as register: true. */
+  register() {
+    if (this._ua) this._ua.register()
   }
 
   call(number) {

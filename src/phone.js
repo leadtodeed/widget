@@ -224,11 +224,14 @@ export class LeadtodeedPhone extends EventEmitter {
     return Math.floor((Date.now() - this._callStartedAt) / 1000)
   }
 
-  async connect() {
+  // `register: false` warms the transport (token + config + WebSocket)
+  // without REGISTERing — a leadership candidate's standby mode. Complete
+  // with register() at takeover.
+  async connect({ register = true } = {}) {
     try {
       await this._auth.fetchToken()
       const config = await this._auth.fetchSipConfig(this._leadtodeedUrl)
-      this._sip.connect(config.sip, config.ice_servers)
+      this._sip.connect(config.sip, config.ice_servers, { register })
       this._startWatchdog()
     } catch (e) {
       this.emit('error', e)
@@ -236,12 +239,44 @@ export class LeadtodeedPhone extends EventEmitter {
     }
   }
 
-  disconnect() {
+  /** REGISTER on a warm (connect({register: false})) transport. Resolves on
+   *  the 'registered' event; rejects on timeout so a takeover attempt over a
+   *  socket that died while on standby fails fast instead of hanging. */
+  register({ timeoutMs = 10_000 } = {}) {
+    if (this._registered) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      const onRegistered = () => {
+        cleanup()
+        resolve()
+      }
+      const timer = setTimeout(() => {
+        cleanup()
+        reject(new Error('SIP register timeout'))
+      }, timeoutMs)
+      const cleanup = () => {
+        clearTimeout(timer)
+        this.off('registered', onRegistered)
+      }
+      this.on('registered', onRegistered)
+      this._sip.register()
+    })
+  }
+
+  /** Tear down the SIP side only — watchdog, socket, registration — keeping
+   *  auth (and with it telemetry) alive. Used for leadership handoffs and
+   *  candidate aborts; full disconnect() is for page teardown. */
+  stopSip() {
+    // The epoch bump also cancels any in-flight watchdog restart.
     this._disconnectEpoch += 1
     this._stopWatchdog()
     this._sip.disconnect()
-    this._auth.destroy()
     this._registered = false
+    this._lastRegisteredAt = null
+  }
+
+  disconnect() {
+    this.stopSip()
+    this._auth.destroy()
   }
 
   // --- SIP registration watchdog (see constants at the top of this file) ---

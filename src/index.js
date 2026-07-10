@@ -21,7 +21,7 @@
 import { LeadtodeedPhone } from './phone.js'
 import { createCallState, addEvent, transitionPhase } from './state.js'
 import { CallEventsSocket } from './call-events-ws.js'
-import { becomeLeader } from './leader.js'
+import { LeadershipManager } from './leadership.js'
 import { installActivityTracker, secondsSinceLastInput } from './activity.js'
 
 const HEARTBEAT_MS = 30_000
@@ -73,7 +73,14 @@ export default function Leadtodeed({
     onError: (err) => console.error("[Leadtodeed]", err),
   })
 
+  // Assigned below (after the state/render plumbing it needs); declared here
+  // so earlier closures can reference it safely.
+  let leadership = null
+
   function notify() {
+    // Leaders broadcast phase transitions to the protocol channel so a
+    // deferred candidate can take over the moment a call ends.
+    leadership?.onPhaseChange(state.phase)
     if (!renderer) return
     renderer({
       phase: state.phase,
@@ -254,7 +261,9 @@ export default function Leadtodeed({
     // Connect participant events WS on SIP registration so the socket is always up —
     // otherwise server-emitted participant events between bridge setup and SIP connect
     // would be lost. The socket has its own heartbeat + reconnect to stay alive.
-    _connectCallEventsWS()
+    // Leader-only: a candidate REGISTERs moments before its takeover completes;
+    // its events WS opens via the onLeader callback right after.
+    if (!leadership || leadership.isLeader) _connectCallEventsWS()
   })
 
   phone.on('callConnected', ({ bridgeId }) => {
@@ -351,33 +360,34 @@ export default function Leadtodeed({
     // BroadcastChannel not available (SSR, old browsers)
   }
 
-  // Tab leader election: only one tab connects to SIP + call-events at a time.
-  // Followers stay passive until the leader's tab closes (browser releases the lock,
-  // next waiter wins). Cross-tab UI sync continues via BroadcastChannel above.
-  // The host controller already broadcasts state and relays user actions; the
-  // follower tab's local state simply stays idle (no phone events fire) and the
-  // controller's _isRemoteRender path renders state pushed by the leader.
-  let isLeader = false
-  const releaseLock = becomeLeader('leadtodeed-sip', async () => {
-    isLeader = true
-    phone.reporter.report('info', 'leader_acquired')
-    try {
-      await phone.connect()
-    } catch (err) {
-      console.error("[Leadtodeed] leader connect failed:", err)
-    }
+  // Tab leadership: only one tab connects to SIP + call-events at a time, and
+  // leadership follows the user — a tab they interact with becomes a candidate
+  // (second short-lived lock, strictly one at a time), warms a standby
+  // transport, and negotiates a make-before-break takeover from an idle
+  // leader. Ringing/connected leaders are never displaced while responsive;
+  // frozen/dead leaders are stolen from after a grace period. Cross-tab UI
+  // sync continues via BroadcastChannel above: the host controller broadcasts
+  // state and relays user actions, follower tabs render remotely-pushed state.
+  leadership = new LeadershipManager({
+    phone,
+    getPhase: () => state.phase,
+    onLeader: () => _connectCallEventsWS(),
+    onFollower: () => {
+      // Only the leader may hold the events WS (single-socket budget).
+      if (callEventsSocket) {
+        try { callEventsSocket.disconnect() } catch { /* ignore */ }
+        callEventsSocket = null
+      }
+    },
   })
+  leadership.start()
 
-  // Wrap disconnect so an explicit teardown also releases the leader lock,
-  // allowing another waiting tab to take over without closing the browser tab.
+  // Wrap disconnect so an explicit teardown (pagehide) also releases the
+  // leadership locks, letting another tab take over without this tab closing.
   const originalDisconnect = phone.disconnect.bind(phone)
   phone.disconnect = () => {
+    leadership.shutdown()
     originalDisconnect()
-    if (isLeader) {
-      isLeader = false
-      phone.reporter.report('info', 'leader_released')
-    }
-    releaseLock()
   }
 
   // -----------------------------------------------------------------------
@@ -394,7 +404,8 @@ export default function Leadtodeed({
   installActivityTracker()
 
   phone.reporter.report('info', 'session_start', '', {
-    is_leader: isLeader,
+    is_leader: leadership.isLeader,
+    role: leadership.role,
     is_visible: typeof document !== 'undefined' ? document.visibilityState === 'visible' : null,
     has_focus: typeof document !== 'undefined' ? document.hasFocus() : null,
     ua: typeof navigator !== 'undefined' ? (navigator.userAgent || '').slice(0, 200) : '',
@@ -415,7 +426,8 @@ export default function Leadtodeed({
     }
 
     phone.reporter.report('info', 'heartbeat', '', {
-      is_leader: isLeader,
+      is_leader: leadership.isLeader,
+      role: leadership.role,
       is_visible: typeof document !== 'undefined' ? document.visibilityState === 'visible' : null,
       has_focus: typeof document !== 'undefined' ? document.hasFocus() : null,
       sip_registered: phone.isRegistered,

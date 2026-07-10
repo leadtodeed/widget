@@ -24,8 +24,16 @@ const CAP_SECONDS = 5
 
 let lastInputTs = (typeof Date !== 'undefined') ? Date.now() : 0
 let installed = false
+let hadInput = false
+let inputSubscribers = []
 
-function touch() { lastInputTs = Date.now() }
+function touch() {
+  lastInputTs = Date.now()
+  hadInput = true
+  for (const fn of inputSubscribers) {
+    try { fn() } catch { /* subscribers must never break input handling */ }
+  }
+}
 
 /**
  * Register the activity listeners. Idempotent and silently skipped in
@@ -51,4 +59,31 @@ export function secondsSinceLastInput() {
   if (delta < 0) return 0
   if (delta > CAP_SECONDS) return CAP_SECONDS
   return delta
+}
+
+/**
+ * Uncapped input age in ms, for the leadership protocol only: comparing tab
+ * freshness needs real ages, which the capped telemetry value can't provide.
+ * Stays same-origin (Web Locks / BroadcastChannel scope) — never reported to
+ * the backend, so the privacy posture of the capped value is unchanged.
+ * Before any real input this counts from module load.
+ */
+export function msSinceLastInputRaw() {
+  return Math.max(0, Date.now() - lastInputTs)
+}
+
+/** True once the user has actually interacted with this tab at least once.
+ *  Gates leadership succession: a tab without any gesture can't play the
+ *  ringtone or show a mic prompt, so it should lead only as a last resort. */
+export function hasEverHadInput() {
+  return hadInput
+}
+
+/** Subscribe to user-input events (fires on every tracked input, after the
+ *  timestamp update). Returns an unsubscribe function. */
+export function onUserInput(fn) {
+  inputSubscribers.push(fn)
+  return () => {
+    inputSubscribers = inputSubscribers.filter((f) => f !== fn)
+  }
 }
