@@ -91,6 +91,7 @@ export default function Leadtodeed({
       events: state.events,
       participants: state.participants,
       isConference: state.isConference,
+      callUuid: state.callUuid,
       accept: () => phone.answer(),
       decline: () => phone.reject(),
       hangup: () => phone.hangup(),
@@ -226,8 +227,10 @@ export default function Leadtodeed({
     }
   }
 
-  phone.on('incomingCall', async ({ callerNumber, participants: initialParticipants }) => {
-    transitionPhase(state, 'ringing', { number: callerNumber, direction: 'incoming' })
+  phone.on('incomingCall', async ({ callerNumber, callUuid, participants: initialParticipants }) => {
+    transitionPhase(state, 'ringing', {
+      number: callerNumber, direction: 'incoming', callUuid: callUuid || null,
+    })
     if (initialParticipants?.length) {
       state.participants = initialParticipants
       state.isConference = true
@@ -349,6 +352,7 @@ export default function Leadtodeed({
           direction: state.direction,
           connectedAt: state.connectedAt,
           events: state.events,
+          callUuid: state.callUuid,
         })
       }
       // Respond to hello with our own session_id so counting converges.

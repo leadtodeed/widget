@@ -111,6 +111,7 @@ export class LeadtodeedPhone extends EventEmitter {
     this._callNumber = null
     this._callStartedAt = null
     this._registered = false
+    this._callUuid = null
     this._bridgeId = null
     this._isConference = false
 
@@ -172,6 +173,9 @@ export class LeadtodeedPhone extends EventEmitter {
         this._reporter.report('error', 'sip_registration_failed', e?.cause || 'unknown', {
           response: e?.response?.status_code ?? null,
         })
+        // Dedicated event first so register() can reject fast; the generic
+        // 'error' emit is kept for host apps that surface failures.
+        this.emit('registrationFailed', e)
         this.emit('error', new Error(`SIP registration failed: ${e?.cause || 'unknown'}`))
       },
       onNewSession: (session, meta) => this._handleSession(session, meta),
@@ -211,6 +215,10 @@ export class LeadtodeedPhone extends EventEmitter {
     return this._sip.currentSession !== null
   }
 
+  get callUuid() {
+    return this._callUuid
+  }
+
   get bridgeId() {
     return this._bridgeId
   }
@@ -240,14 +248,19 @@ export class LeadtodeedPhone extends EventEmitter {
   }
 
   /** REGISTER on a warm (connect({register: false})) transport. Resolves on
-   *  the 'registered' event; rejects on timeout so a takeover attempt over a
-   *  socket that died while on standby fails fast instead of hanging. */
+   *  the 'registered' event; rejects on registrationFailed or timeout so a
+   *  takeover attempt over a socket that died while on standby fails fast
+   *  instead of hanging. */
   register({ timeoutMs = 10_000 } = {}) {
     if (this._registered) return Promise.resolve()
     return new Promise((resolve, reject) => {
       const onRegistered = () => {
         cleanup()
         resolve()
+      }
+      const onFailed = (e) => {
+        cleanup()
+        reject(new Error(`SIP registration failed: ${e?.cause || 'unknown'}`))
       }
       const timer = setTimeout(() => {
         cleanup()
@@ -256,8 +269,10 @@ export class LeadtodeedPhone extends EventEmitter {
       const cleanup = () => {
         clearTimeout(timer)
         this.off('registered', onRegistered)
+        this.off('registrationFailed', onFailed)
       }
       this.on('registered', onRegistered)
+      this.on('registrationFailed', onFailed)
       this._sip.register()
     })
   }
@@ -415,12 +430,19 @@ export class LeadtodeedPhone extends EventEmitter {
     this._sip.sendDTMF(digit)
   }
 
+  // Mute/unmute are hard no-ops without a live session. Relayed toggleMute
+  // actions from the cross-tab UI reach EVERY tab; only the session owner
+  // may act. If an idle tab fabricated a 'muted' state change here, its
+  // widget would do a local render of phase=idle — which the host controller
+  // broadcasts, wiping the call owner's popup mid-call.
   mute() {
+    if (!this.isInCall) return
     this._sip.mute()
     this.emit('muted', { muted: true })
   }
 
   unmute() {
+    if (!this.isInCall) return
     this._sip.unmute()
     this.emit('muted', { muted: false })
   }
@@ -505,7 +527,8 @@ export class LeadtodeedPhone extends EventEmitter {
   _handleSession(session, meta = {}) {
     const direction = session.direction
 
-    // Store conference metadata from SIP X-headers
+    // Store call identity + conference metadata from SIP X-headers
+    if (meta.callUuid) this._callUuid = meta.callUuid
     if (meta.bridgeId) this._bridgeId = meta.bridgeId
     if (meta.isConference) this._isConference = meta.isConference
 
@@ -517,6 +540,7 @@ export class LeadtodeedPhone extends EventEmitter {
 
       this.emit('incomingCall', {
         callerName, callerNumber,
+        callUuid: meta.callUuid || null,
         bridgeId: meta.bridgeId || null,
         isConference: meta.isConference || false,
         participants: meta.participants || [],
@@ -539,6 +563,7 @@ export class LeadtodeedPhone extends EventEmitter {
     const onEnd = (e) => {
       const duration = this.callDuration
       this._callStartedAt = null
+      this._callUuid = null
       this._bridgeId = null
       this._isConference = false
       this.emit('callEnded', {

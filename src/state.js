@@ -24,6 +24,8 @@ export function createCallState() {
     events: [],
     participants: [],    // [{ user_id, name, extension }]
     isConference: false,
+    callUuid: null,      // from the INVITE's X-Call-Uuid; identifies the call
+                         // across surfaces (notification tag, push, pull-answer)
     bridgeId: null,
   }
 }
@@ -56,6 +58,7 @@ export function transitionPhase(state, newPhase, attrs = {}) {
     state.events = []
     state.participants = []
     state.isConference = false
+    state.callUuid = null
     state.bridgeId = null
   }
   return true

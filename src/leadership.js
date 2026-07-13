@@ -55,6 +55,15 @@ const CANDIDACY_DEBOUNCE_MS = 2_000
 const YIELD_MARGIN_MS = 5_000
 const YIELD_TIMEOUT_MS = 5_000
 // Succession race: delay ∝ input staleness, so the freshest tab claims first.
+// After an explicit lead_bye the leader is KNOWN gone and the stagger only
+// has to ORDER the race, not hedge against false positives — so it is
+// compressed to ~0-2s (a call arriving seconds after the leader tab closes
+// must find a registered successor). Silence-triggered vacancy keeps the
+// lazy pace: its false positive (a throttled-but-alive leader) is cheap
+// because the candidacy aborts on the first heartbeat/pong anyway.
+const BYE_STAGGER_MS_PER_SECOND = 50
+const BYE_STAGGER_MAX_MS = 2_000
+const BYE_NO_INPUT_STAGGER_MS = 5_000
 const VACANCY_STAGGER_MS_PER_SECOND = 250
 const VACANCY_STAGGER_MAX_MS = 30_000
 const NO_INPUT_STAGGER_MS = 45_000 // zero-input tabs go last
@@ -245,6 +254,12 @@ export class LeadershipManager {
       if (msg.input_age_ms + YIELD_MARGIN_MS < this._getInputAgeMs()) {
         this._abortCandidacy('yielded')
         this._send({ type: 'yield_done', from: this._id, to: msg.from })
+      } else {
+        // Decline EXPLICITLY. A silent decline is indistinguishable from a
+        // frozen candidate, and the requester's no-reply timeout would steal
+        // the candidacy — two alive tabs then ping-pong steals at each other
+        // and neither ever finishes a takeover (observed in prod).
+        this._send({ type: 'yield_denied', from: this._id, to: msg.from })
       }
     }
   }
@@ -387,6 +402,15 @@ export class LeadershipManager {
 
   async _runCandidacy(trigger) {
     const candidate = this._candidate
+    // A vacancy race already believes the leader is gone — when the lock is
+    // verifiably free, take over immediately instead of spending a probe
+    // timeout waiting for a pong from a dead tab. (Held-or-unknown falls
+    // through to the probe loop: the "vacancy" may be a false positive.)
+    if (trigger.startsWith('vacancy')) {
+      const held = await isLockHeld(LEADER_LOCK)
+      if (this._cancelled(candidate)) return
+      if (held === false) return this._takeover('vacancy')
+    }
     while (!this._cancelled(candidate)) {
       const pong = await this._probeLeader()
       if (this._cancelled(candidate)) return
@@ -530,17 +554,20 @@ export class LeadershipManager {
   }
 
   /** Another tab holds the candidacy. Ask it to yield; if it's frozen and
-   *  never answers while our user is active, take the candidacy by force. */
+   *  never answers while our user is active, take the candidacy by force.
+   *  An explicit yield_denied means it's alive and staying — back off until
+   *  the next input instead of stealing from a healthy candidate. */
   _requestYield() {
     this._send({ type: 'yield_request', from: this._id, input_age_ms: this._getInputAgeMs() })
-    this._waitMessage(['yield_done'], {
+    this._waitMessage(['yield_done', 'yield_denied'], {
       timeoutMs: YIELD_TIMEOUT_MS,
       filter: (m) => m.to === this._id,
     }).then((reply) => {
       if (this._shutdown || this._role !== 'follower' || this._candidate) return
-      if (reply) {
+      if (reply?.type === 'yield_done') {
         this._startCandidacy('yield')
-      } else if (this._getInputAgeMs() < YIELD_TIMEOUT_MS + INPUT_FRESH_MS) {
+      } else if (!reply && this._getInputAgeMs() < YIELD_TIMEOUT_MS + INPUT_FRESH_MS) {
+        // Only total silence past the timeout counts as "frozen".
         this._startCandidacy('yield_steal', { stealCandidateLock: true })
       }
     })
@@ -561,10 +588,15 @@ export class LeadershipManager {
     if (this._vacancyClaimTimer) return
     // Staleness-staggered race: the freshest-input tab claims first; tabs the
     // user never touched go last (they can't play audio without a gesture).
-    const delay = this._getHasEverHadInput()
-      ? Math.min((this._getInputAgeMs() / 1000) * VACANCY_STAGGER_MS_PER_SECOND, VACANCY_STAGGER_MAX_MS)
-      : NO_INPUT_STAGGER_MS
-    const jitter = Math.random() * 500
+    const inputAgeS = this._getInputAgeMs() / 1000
+    const delay = why === 'bye'
+      ? (this._getHasEverHadInput()
+        ? Math.min(inputAgeS * BYE_STAGGER_MS_PER_SECOND, BYE_STAGGER_MAX_MS)
+        : BYE_NO_INPUT_STAGGER_MS)
+      : (this._getHasEverHadInput()
+        ? Math.min(inputAgeS * VACANCY_STAGGER_MS_PER_SECOND, VACANCY_STAGGER_MAX_MS)
+        : NO_INPUT_STAGGER_MS)
+    const jitter = Math.random() * (why === 'bye' ? 250 : 500)
     this._vacancyClaimTimer = setTimeout(() => {
       this._vacancyClaimTimer = null
       if (this._shutdown || this._role !== 'follower' || this._candidate) return

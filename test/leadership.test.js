@@ -267,9 +267,12 @@ describe('LeadershipManager', () => {
     // to test succession... instead, keep A leader by closing B's candidacy
     // window: simpler — shut A down and let the stagger race decide.
     a.manager.shutdown()
-    await vi.advanceTimersByTimeAsync(5_000)
+    // The bye race must converge fast — a call arriving seconds after the
+    // leader closed needs a registered successor (observed prod miss at +4s).
+    await vi.advanceTimersByTimeAsync(2_000)
 
     expect(b.manager.role).toBe('leader')
+    expect(b.phone.registered).toBe(true)
     expect(c.manager.role).toBe('follower')
   })
 
@@ -281,10 +284,10 @@ describe('LeadershipManager', () => {
     await settle()
 
     a.manager.shutdown()
-    await vi.advanceTimersByTimeAsync(30_000)
-    expect(b.manager.role).toBe('follower') // still inside NO_INPUT stagger
+    await vi.advanceTimersByTimeAsync(3_000)
+    expect(b.manager.role).toBe('follower') // still inside the no-input bye stagger
 
-    await vi.advanceTimersByTimeAsync(30_000)
+    await vi.advanceTimersByTimeAsync(5_000)
     expect(b.manager.role).toBe('leader')
     expect(b.phone.registered).toBe(true)
   })
@@ -310,6 +313,51 @@ describe('LeadershipManager', () => {
     expect(c.manager.role).toBe('follower')
     expect(c.phone.stopSip).toHaveBeenCalled() // dropped its warm socket
     expect(b.manager.role).toBe('candidate')
+  })
+
+  it('a declined yield does not steal the candidacy (no ping-pong)', async () => {
+    const a = makeTab('A', log)
+    const b = makeTab('B', log)
+    const c = makeTab('C', log)
+    await a.manager.start()
+    await b.manager.start()
+    await c.manager.start()
+    await settle()
+
+    a.phase = 'connected' // busy leader keeps the candidacy held
+    c.input()
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(c.manager.role).toBe('candidate')
+
+    // B's input is fresher, but not by the yield margin — C declines.
+    b.input()
+    await vi.advanceTimersByTimeAsync(10_000) // well past the yield timeout
+
+    expect(c.manager.role).toBe('candidate')
+    expect(c.phone.stopSip).not.toHaveBeenCalled()
+    expect(b.manager.role).toBe('follower')
+  })
+
+  it('a frozen candidate is stolen from after the yield timeout', async () => {
+    const a = makeTab('A', log)
+    const b = makeTab('B', log)
+    const c = makeTab('C', log)
+    await a.manager.start()
+    await b.manager.start()
+    await c.manager.start()
+    await settle()
+
+    a.phase = 'connected'
+    c.input()
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(c.manager.role).toBe('candidate')
+
+    c.freeze() // can't answer the yield request
+    b.input()
+    await vi.advanceTimersByTimeAsync(7_000) // yield timeout + steal
+
+    expect(b.manager.role).toBe('candidate')
+    expect(c.phone.stopSip).toHaveBeenCalled() // deposed candidate dropped its warm socket
   })
 
   it('debounces candidacy triggers', async () => {

@@ -6,6 +6,77 @@ import JsSIP from 'jssip'
 
 const ICE_GATHERING_TIMEOUT = 1000
 
+// Dev-tenant only. Hostnames there always carry a `localhost` label
+// (localhost.leadtodeed.ai, collective-london.localhost.leadtodeed.ai); prod
+// (homey.leadtodeed.ai, *.homey.co.uk) never does. `window.LEADTODEED_DEBUG =
+// true` force-enables it anywhere.
+const isDebugHost = () => {
+  if (typeof window === 'undefined') return false
+  if (window.LEADTODEED_DEBUG === true) return true
+  return /(^|\.)localhost(\.|$)/i.test(window.location?.hostname || '')
+}
+
+/**
+ * Dump the X-headers of an incoming INVITE, on the wire and as parsed.
+ *
+ * These headers are the hardest thing in the system to debug, because every
+ * failure is silent: each read is optional-chained to null, so "the PBX never
+ * sent it", "I read it off the wrong object" and "it arrived and was empty" all
+ * look identical downstream. Two stacked bugs hid here for months —
+ * PJSIP_HEADER() no-oping on the Local channel (nothing sent) and
+ * `session.request` being undefined in JsSIP 3.x (nothing read). This prints
+ * both halves side by side so they can never be confused again:
+ *
+ *   - RAW  = what actually arrived on the wire (from the SIP message text)
+ *   - READ = what getHeader() returned
+ *
+ * RAW populated + READ null  → client-side read bug (wrong object/name).
+ * RAW empty                  → PBX side: check [meowgent-callee-headers] ran
+ *                              and the __X_* vars were inherited.
+ */
+function debugInviteHeaders(e, parsed) {
+  try {
+    const request = e.request
+    const raw = typeof request?.data === 'string' ? request.data : ''
+    const wire = raw
+      .split(/\r?\n/)
+      .filter(line => /^X-/i.test(line))
+      .map(line => line.trim())
+
+    const ok = Boolean(parsed.callUuid)
+    console.groupCollapsed(
+      `[Leadtodeed] INVITE X-headers — callUuid ${ok ? 'OK' : 'MISSING'}`
+    )
+    if (!request) {
+      console.error(
+        'e.request is undefined — cannot read any header. JsSIP 3.x RTCSession ' +
+        'has no `request` getter; the INVITE is on the EVENT, not the session.'
+      )
+    }
+    console.log('RAW on the wire:', wire.length ? wire : '(no X- headers at all)')
+    console.log('READ via getHeader():', {
+      'X-Call-Uuid': parsed.callUuid,
+      'X-Bridge-Id': parsed.bridgeId,
+      'X-Conference': parsed.isConference,
+      'X-Participants-B64': parsed.participants,
+    })
+    if (wire.length && !ok) {
+      console.warn(
+        'Header IS on the wire but did not parse → client-side read bug.'
+      )
+    } else if (!wire.length) {
+      console.warn(
+        'No X- headers on the wire → PBX side. Check that the Dial in ' +
+        '[meowgent-dial-contacts] carries b(meowgent-callee-headers^s^1) and ' +
+        'that ARI/webrtc_backend set the __X_* inherited variables.'
+      )
+    }
+    console.groupEnd()
+  } catch {
+    /* debug output must never break call setup */
+  }
+}
+
 /**
  * Patch RTCPeerConnection to force ICE gathering completion after timeout.
  * Asterisk WebRTC can take too long to gather ICE candidates.
@@ -251,9 +322,25 @@ export class SipClient {
 
   /** REGISTER on the already-connected UA (candidate takeover after a
    *  connect({register: false}) warm-up). JsSIP keeps auto-refreshing after
-   *  a manual register(), same as register: true. */
+   *  a manual register(), same as register: true.
+   *
+   *  connect() only *initiates* the WebSocket — registering before the
+   *  transport is up makes JsSIP fail the transaction immediately with
+   *  "Connection Error". Defer until the UA reports connected. */
   register() {
-    if (this._ua) this._ua.register()
+    const ua = this._ua
+    if (!ua) return
+    if (ua.isConnected()) {
+      ua.register()
+      return
+    }
+    if (this._pendingRegister) return
+    this._pendingRegister = true
+    ua.once('connected', () => {
+      this._pendingRegister = false
+      // The UA may have been stopped while we waited (candidacy aborted).
+      try { this._ua?.register() } catch { /* transport raced away */ }
+    })
   }
 
   call(number) {
@@ -390,18 +477,40 @@ export class SipClient {
     const session = e.session
     this._currentSession = session
 
-    // Read X-headers from incoming SIP INVITE for conference context
-    const request = session.request
+    // Read X-headers from the incoming SIP INVITE. These are set by the
+    // [meowgent-callee-headers] pre-dial handler on the PBX — NOT by the ARI /
+    // backend originate, whose PJSIP_HEADER() writes land on a Local channel
+    // and silently no-op. callUuid identifies the call across surfaces (page
+    // notification tag, Web Push payload, pull-answer matching).
+    //
+    // The INVITE comes off the EVENT, not the session. JsSIP 3.x RTCSession
+    // keeps it as the private `_request` and exposes no `request` getter
+    // (getters: causes/id/connection/contact/direction/local_identity/
+    // remote_identity/start_time/end_time/data/status), so `session.request` is
+    // undefined and every getHeader() below optional-chains silently to null.
+    // `_newRTCSession()` emits {originator, session, request} — use e.request.
+    const request = e.request
+    const callUuid = request?.getHeader?.('X-Call-Uuid') || null
     const bridgeId = request?.getHeader?.('X-Bridge-Id') || null
     const isConference = request?.getHeader?.('X-Conference') === 'true'
     let participants = []
     try {
-      const raw = request?.getHeader?.('X-Participants')
-      if (raw) participants = JSON.parse(raw)
-    } catch { /* ignore parse errors */ }
+      // Base64, not raw JSON: JSON can't traverse the dialplan safely (its
+      // quotes break ast_expr2, its colons break ExecIf's branch split), and
+      // its commas collide with SIP's list-header separator. Decode via
+      // TextDecoder rather than JSON.parse(atob(...)) — atob yields latin1, so
+      // the naive form mangles any non-ASCII name ("Renée").
+      const raw = request?.getHeader?.('X-Participants-B64')
+      if (raw) {
+        const bytes = Uint8Array.from(atob(raw), c => c.charCodeAt(0))
+        participants = JSON.parse(new TextDecoder().decode(bytes))
+      }
+    } catch { /* ignore malformed header */ }
+
+    if (isDebugHost()) debugInviteHeaders(e, { callUuid, bridgeId, isConference, participants })
 
     this._setupSessionEvents(session)
-    this._callbacks.onNewSession?.(session, { bridgeId, isConference, participants })
+    this._callbacks.onNewSession?.(session, { callUuid, bridgeId, isConference, participants })
   }
 
   _setupSessionEvents(session) {
