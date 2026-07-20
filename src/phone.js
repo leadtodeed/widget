@@ -56,6 +56,14 @@ const WATCHDOG_INTERVAL_MS = 15_000
 // A tick arriving this late means the page was suspended. Chrome throttles
 // hidden-tab timers to 1/min, so the threshold sits safely above that.
 const WATCHDOG_SUSPEND_GAP_MS = 120_000
+// Asterisk reaps an idle WSS after ~60s of silence, so ANY suspend longer
+// than this leaves a zombie socket no matter how fresh the last REGISTER
+// was. The registration-age check alone misses the 60–150s suspend band:
+// the watchdog would stand down, JsSIP's flushed refresh timer would
+// REGISTER into the dead socket, and the extension stayed deaf for Timer F
+// (32s) + up to another age-threshold crossing. Above this gap the socket
+// is presumed dead and restarted on wake unconditionally.
+const WATCHDOG_SOCKET_DEAD_GAP_MS = 75_000
 // ≥2 missed REGISTER refreshes at register_expires=60.
 const REGISTRATION_STALE_MS = 150_000
 // Backoff between restarts that fail to bring the registration back — reset
@@ -170,13 +178,21 @@ export class LeadtodeedPhone extends EventEmitter {
       },
       onRegistrationFailed: (e) => {
         this._registered = false
-        this._reporter.report('error', 'sip_registration_failed', e?.cause || 'unknown', {
-          response: e?.response?.status_code ?? null,
-        })
+        // A failure while the watchdog is mid-restart is the EXPECTED death
+        // rattle of the socket being replaced — log it quietly and don't
+        // surface it to the host app's console/Sentry as an error.
+        const expected = this._watchdogRestarting
+        this._reporter.report(expected ? 'info' : 'error', 'sip_registration_failed',
+          e?.cause || 'unknown', {
+            response: e?.response?.status_code ?? null,
+            during_watchdog_restart: expected,
+          })
         // Dedicated event first so register() can reject fast; the generic
         // 'error' emit is kept for host apps that surface failures.
         this.emit('registrationFailed', e)
-        this.emit('error', new Error(`SIP registration failed: ${e?.cause || 'unknown'}`))
+        if (!expected) {
+          this.emit('error', new Error(`SIP registration failed: ${e?.cause || 'unknown'}`))
+        }
       },
       onNewSession: (session, meta) => this._handleSession(session, meta),
       onDisconnected: (e) => {
@@ -205,6 +221,22 @@ export class LeadtodeedPhone extends EventEmitter {
    *  without reaching into a private field. */
   get reporter() {
     return this._reporter
+  }
+
+  /** Current backend JWT, or null before connect() has fetched one.
+   *
+   *  Exposed so the host controller can call webrtc_backend's authenticated
+   *  APIs (e.g. /api/push/subscriptions) without reaching into `_auth`, which
+   *  index.js already does in three places. In-memory only and refreshed on a
+   *  timer — a service worker cannot read it, so anything a SW needs must go
+   *  through an endpoint that doesn't require it. */
+  get token() {
+    return this._auth?.token || null
+  }
+
+  /** Base URL of this tenant's webrtc_backend (https://{subdomain}.leadtodeed.ai). */
+  get backendUrl() {
+    return this._leadtodeedUrl
   }
 
   get isRegistered() {
@@ -305,17 +337,26 @@ export class LeadtodeedPhone extends EventEmitter {
       this._watchdogLastTickAt = now
       // An overdue tick is itself the resume signal: suspended pages fire
       // their missed interval once, immediately on resume.
-      this._watchdogCheck(gap > WATCHDOG_SUSPEND_GAP_MS ? 'resume' : 'interval')
+      this._watchdogCheck(gap > WATCHDOG_SUSPEND_GAP_MS ? 'resume' : 'interval', gap)
     }, WATCHDOG_INTERVAL_MS)
+    // The event-driven wake signals measure the sleep gap off the same
+    // tick clock WITHOUT resetting it — the interval remains the only
+    // writer, so a visible+pageshow+online burst on one resume all see
+    // the same gap instead of the first one zeroing it for the rest.
+    const gapNow = () => Date.now() - this._watchdogLastTickAt
     if (typeof document !== 'undefined') {
       this._watchdogVisHandler = () => {
-        if (document.visibilityState === 'visible') this._watchdogCheck('visible')
+        if (document.visibilityState === 'visible') this._watchdogCheck('visible', gapNow())
       }
       document.addEventListener('visibilitychange', this._watchdogVisHandler)
     }
     if (typeof window !== 'undefined') {
-      this._watchdogPageshowHandler = () => this._watchdogCheck('pageshow')
+      this._watchdogPageshowHandler = () => this._watchdogCheck('pageshow', gapNow())
       window.addEventListener('pageshow', this._watchdogPageshowHandler)
+      // Network came back (wifi switch, VPN flap, wake without visibility
+      // change) — the old socket is dead by definition.
+      this._watchdogOnlineHandler = () => this._watchdogCheck('online', gapNow())
+      window.addEventListener('online', this._watchdogOnlineHandler)
     }
   }
 
@@ -332,9 +373,13 @@ export class LeadtodeedPhone extends EventEmitter {
       window.removeEventListener('pageshow', this._watchdogPageshowHandler)
       this._watchdogPageshowHandler = null
     }
+    if (this._watchdogOnlineHandler) {
+      window.removeEventListener('online', this._watchdogOnlineHandler)
+      this._watchdogOnlineHandler = null
+    }
   }
 
-  _watchdogCheck(reason) {
+  _watchdogCheck(reason, sleepGapMs = 0) {
     if (!this._watchdogTimer || this._watchdogRestarting) return
     // A live session means the media path is up (the zombie scenario cannot
     // coexist with flowing RTP) — and restarting the UA would kill the call.
@@ -343,7 +388,14 @@ export class LeadtodeedPhone extends EventEmitter {
     // JsSIP's to retry; restarting here would loop on bad credentials.
     if (this._lastRegisteredAt === null) return
     const registeredAgoMs = Date.now() - this._lastRegisteredAt
-    if (registeredAgoMs < REGISTRATION_STALE_MS) return
+    // Two independent reasons to restart:
+    //  - stale registration (the original zombie detector), OR
+    //  - a suspend longer than the server's WSS idle reap: the socket is
+    //    presumed dead even when the last REGISTER looks fresh. Without
+    //    this, a 60–150s sleep woke into JsSIP refreshing over the corpse
+    //    and a Timer F (32s) "Request Timeout" before recovery.
+    const presumeDead = sleepGapMs > WATCHDOG_SOCKET_DEAD_GAP_MS
+    if (!presumeDead && registeredAgoMs < REGISTRATION_STALE_MS) return
     // No network at all (fresh wake from sleep) — cycling the transport now
     // just burns the backoff budget; the next tick retries once online.
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return
@@ -356,6 +408,8 @@ export class LeadtodeedPhone extends EventEmitter {
     this._watchdogRestartCount += 1
     this._reporter.report('warn', 'sip_watchdog_stale', reason, {
       registered_ago_ms: registeredAgoMs,
+      sleep_gap_ms: Math.round(sleepGapMs),
+      presumed_dead: presumeDead,
       // JsSIP's belief — expected to be a stale `true` in the zombie case.
       registered: this._registered,
       restart_count: this._watchdogRestartCount,

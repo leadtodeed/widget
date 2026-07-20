@@ -131,8 +131,16 @@ export class CallEventsSocket {
   _armStuckTimer() {
     this._clearStuckTimer()
     this._stuckTimer = setTimeout(() => {
-      console.warn('[Leadtodeed] WS stuck — no messages for', STUCK_TIMEOUT, 'ms, reconnecting')
-      this._reporter?.report('warn', 'call_events_ws_stuck', `no messages for ${STUCK_TIMEOUT}ms`)
+      // The actual silence tells suspend-resume (timer flushed after a long
+      // sleep, gap >> STUCK_TIMEOUT — reconnect is correct, the server
+      // reaped the idle socket long ago) apart from a genuine live stall
+      // (gap ≈ STUCK_TIMEOUT with the tab awake the whole time).
+      const sinceLastMs = Date.now() - this._lastMessageAt
+      console.warn('[Leadtodeed] WS stuck — no messages for', sinceLastMs, 'ms, reconnecting')
+      this._reporter?.report('warn', 'call_events_ws_stuck', `no messages for ${sinceLastMs}ms`, {
+        since_last_ms: sinceLastMs,
+        suspected_suspend: sinceLastMs > STUCK_TIMEOUT * 2,
+      })
       this._forceReconnect()
     }, STUCK_TIMEOUT)
   }
