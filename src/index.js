@@ -23,6 +23,7 @@ import { createCallState, addEvent, transitionPhase } from './state.js'
 import { CallEventsSocket } from './call-events-ws.js'
 import { LeadershipManager } from './leadership.js'
 import { installActivityTracker, secondsSinceLastInput } from './activity.js'
+import { detectVersion } from './version.js'
 
 const HEARTBEAT_MS = 30_000
 const NEIGHBOR_PING_INTERVAL_MS = 30_000
@@ -406,6 +407,19 @@ export default function Leadtodeed({
   // first ~second include it.
 
   installActivityTracker()
+
+  // Stamp the lib's own build hash (from the content-addressed URL it
+  // loaded from) into every client_log line. The host controller adds
+  // its controller_version via the same setStaticContext — the reporter
+  // merges both. import.meta.url is rewritten/dropped by bundlers in
+  // IIFE output; detectVersion's fallback chain covers those cases.
+  phone.reporter.setStaticContext({
+    widget_version: detectVersion({
+      metaUrl: import.meta.url,
+      filename: 'leadtodeed-widget',
+      overrideKey: 'widget',
+    }),
+  })
 
   phone.reporter.report('info', 'session_start', '', {
     is_leader: leadership.isLeader,

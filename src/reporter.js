@@ -27,6 +27,7 @@ export class Reporter {
     this._auth = auth
     this._sessionId = sessionId || null
     this._viaHost = null
+    this._staticContext = {}
     this._maxPerWindow = Number.isFinite(maxPerMinute) && maxPerMinute > 0
       ? Math.floor(maxPerMinute)
       : DEFAULT_MAX_PER_MINUTE
@@ -36,6 +37,16 @@ export class Reporter {
   /** Set once the SIP UA is constructed. Subsequent reports carry via_host. */
   setViaHost(host) {
     this._viaHost = host || null
+  }
+
+  /**
+   * Merge fields into every subsequent report's context (build versions,
+   * environment tags). MERGES rather than replaces so independent callers
+   * — the lib stamping widget_version, the host controller stamping
+   * controller_version — can each contribute without coordination.
+   */
+  setStaticContext(ctx) {
+    Object.assign(this._staticContext, ctx || {})
   }
 
   get sessionId() { return this._sessionId }
@@ -54,6 +65,7 @@ export class Reporter {
       via_host: this._viaHost,
       message: String(message ?? '').slice(0, 500),
       context: {
+        ...this._staticContext,
         ...context,
         url: typeof location !== 'undefined' ? location.href : '',
       },
