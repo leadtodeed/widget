@@ -228,9 +228,10 @@ export default function Leadtodeed({
     }
   }
 
-  phone.on('incomingCall', async ({ callerNumber, callUuid, participants: initialParticipants }) => {
+  phone.on('incomingCall', async ({ callerNumber, callUuid, participants: initialParticipants, did, didLabel }) => {
     transitionPhase(state, 'ringing', {
       number: callerNumber, direction: 'incoming', callUuid: callUuid || null,
+      did: did || null, didLabel: didLabel || null,
     })
     if (initialParticipants?.length) {
       state.participants = initialParticipants

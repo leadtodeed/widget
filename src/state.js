@@ -27,6 +27,8 @@ export function createCallState() {
     callUuid: null,      // from the INVITE's X-Call-Uuid; identifies the call
                          // across surfaces (notification tag, push, pull-answer)
     bridgeId: null,
+    did: null,           // the line the customer dialed (X-Did, +E.164)
+    didLabel: null,      // its human name (X-Did-Label-B64, e.g. a brand)
   }
 }
 
@@ -60,6 +62,8 @@ export function transitionPhase(state, newPhase, attrs = {}) {
     state.isConference = false
     state.callUuid = null
     state.bridgeId = null
+    state.did = null
+    state.didLabel = null
   }
   return true
 }

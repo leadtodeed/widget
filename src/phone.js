@@ -598,6 +598,8 @@ export class LeadtodeedPhone extends EventEmitter {
         bridgeId: meta.bridgeId || null,
         isConference: meta.isConference || false,
         participants: meta.participants || [],
+        did: meta.did || null,
+        didLabel: meta.didLabel || null,
       })
     }
 

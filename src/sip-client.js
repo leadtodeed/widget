@@ -493,6 +493,19 @@ export class SipClient {
     const callUuid = request?.getHeader?.('X-Call-Uuid') || null
     const bridgeId = request?.getHeader?.('X-Bridge-Id') || null
     const isConference = request?.getHeader?.('X-Conference') === 'true'
+    // Which line the customer dialed. The label is base64 for the same
+    // reason X-Participants is: it's free text (spaces today, maybe commas
+    // or non-ASCII tomorrow) and must survive the dialplan's Set() argument
+    // parsing. TextDecoder, not bare atob — atob yields latin1.
+    const did = request?.getHeader?.('X-Did') || null
+    let didLabel = null
+    try {
+      const rawLabel = request?.getHeader?.('X-Did-Label-B64')
+      if (rawLabel) {
+        const bytes = Uint8Array.from(atob(rawLabel), c => c.charCodeAt(0))
+        didLabel = new TextDecoder().decode(bytes) || null
+      }
+    } catch { /* ignore malformed header */ }
     let participants = []
     try {
       // Base64, not raw JSON: JSON can't traverse the dialplan safely (its
@@ -510,7 +523,7 @@ export class SipClient {
     if (isDebugHost()) debugInviteHeaders(e, { callUuid, bridgeId, isConference, participants })
 
     this._setupSessionEvents(session)
-    this._callbacks.onNewSession?.(session, { callUuid, bridgeId, isConference, participants })
+    this._callbacks.onNewSession?.(session, { callUuid, bridgeId, isConference, participants, did, didLabel })
   }
 
   _setupSessionEvents(session) {
