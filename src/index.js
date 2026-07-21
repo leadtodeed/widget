@@ -93,6 +93,8 @@ export default function Leadtodeed({
       participants: state.participants,
       isConference: state.isConference,
       callUuid: state.callUuid,
+      did: state.did,
+      didLabel: state.didLabel,
       accept: () => phone.answer(),
       decline: () => phone.reject(),
       hangup: () => phone.hangup(),
