@@ -59,6 +59,8 @@ function debugInviteHeaders(e, parsed) {
       'X-Bridge-Id': parsed.bridgeId,
       'X-Conference': parsed.isConference,
       'X-Participants-B64': parsed.participants,
+      'X-Did': parsed.did,
+      'X-Did-Label-B64 (decoded)': parsed.didLabel,
     })
     if (wire.length && !ok) {
       console.warn(
@@ -520,7 +522,7 @@ export class SipClient {
       }
     } catch { /* ignore malformed header */ }
 
-    if (isDebugHost()) debugInviteHeaders(e, { callUuid, bridgeId, isConference, participants })
+    if (isDebugHost()) debugInviteHeaders(e, { callUuid, bridgeId, isConference, participants, did, didLabel })
 
     this._setupSessionEvents(session)
     this._callbacks.onNewSession?.(session, { callUuid, bridgeId, isConference, participants, did, didLabel })
