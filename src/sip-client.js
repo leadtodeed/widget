@@ -218,9 +218,10 @@ export class SipClient {
     this._callbacks = { onRegistered, onUnregistered, onRegistrationFailed, onNewSession, onDisconnected, onWsOpened }
     // Host-supplied callback returning the `audio` value for getUserMedia /
     // JsSIP mediaConstraints — typically `{ deviceId: { exact: '<id>' } }`
-    // when the user has picked a specific microphone, or undefined to fall
-    // back to the browser default. Called fresh at every call()/answer() so
-    // a localStorage change takes effect on the next call.
+    // when the user has picked a specific microphone, optionally with
+    // processing flags (echoCancellation/noiseSuppression/autoGainControl),
+    // or undefined to fall back to the browser default. Called fresh at every
+    // call()/answer() so a localStorage change takes effect on the next call.
     this._getAudioConstraints = typeof getAudioConstraints === 'function' ? getAudioConstraints : null
   }
 
@@ -243,6 +244,17 @@ export class SipClient {
 
   get isRegistered() {
     return this._ua ? this._ua.isRegistered() : false
+  }
+
+  /** Whether the UA's WebSocket transport is currently up. False both when
+   *  the socket dropped and before connect() — pair with hasUA to tell a
+   *  dead transport from a not-yet-started one. */
+  get isConnected() {
+    return this._ua ? this._ua.isConnected() : false
+  }
+
+  get hasUA() {
+    return this._ua !== null
   }
 
   get currentSession() {
@@ -375,8 +387,11 @@ export class SipClient {
     }
   }
 
+  // Returns false when there is no session to answer — the caller must
+  // surface that (telemetry + UI). A bare `return` here spent months hiding
+  // "Accept did nothing" behind an unregistered/ghost-ringing tab.
   answer() {
-    if (!this._currentSession) return
+    if (!this._currentSession) return false
 
     const options = {
       mediaConstraints: { audio: this._audioConstraint(), video: false },
@@ -388,13 +403,43 @@ export class SipClient {
     }
 
     this._currentSession.answer(options)
+    return true
   }
 
   /**
-   * Live-switch the microphone used by the current SIP session, if any. Pulls
-   * a new MediaStream from getUserMedia and swaps it into the audio sender
-   * via replaceTrack() — the call's signalling/SDP is untouched, only the
-   * upstream track changes.
+   * Live-switch the microphone used by the current SIP session, if any.
+   *
+   * The explicit `deviceId` is overlaid on the host's `getAudioConstraints()`
+   * result so a device swap keeps the host's processing flags
+   * (echoCancellation/noiseSuppression/autoGainControl) instead of silently
+   * resetting them to browser defaults.
+   *
+   * `deviceId` may be falsy/'default' — the browser picks its current default
+   * device, host flags still apply.
+   */
+  async setMicrophone(deviceId) {
+    const host = this._audioConstraint()
+    const merged = host === true ? {} : { ...host }
+    if (deviceId && deviceId !== 'default') merged.deviceId = { exact: deviceId }
+    else delete merged.deviceId
+    return this._swapMicTrack(Object.keys(merged).length ? merged : true)
+  }
+
+  /**
+   * Re-acquire the mic with the host's current `getAudioConstraints()` result
+   * and swap it into the live call. Lets a processing-flag change (e.g. the
+   * host's noise-suppression toggle) take effect mid-call — `applyConstraints`
+   * on the live track is not used because Chrome silently ignores it for
+   * echoCancellation.
+   */
+  async refreshAudioConstraints() {
+    return this._swapMicTrack(this._audioConstraint())
+  }
+
+  /**
+   * Pull a new MediaStream for `audioConstraint` and swap it into the audio
+   * sender via replaceTrack() — the call's signalling/SDP is untouched, only
+   * the upstream track changes.
    *
    * Returns `true` if the swap succeeded, `false` if there's no active session,
    * no audio sender, or getUserMedia rejected (e.g. device disappeared).
@@ -403,19 +448,13 @@ export class SipClient {
    * mute()/unmute() calls continue to work after the swap without touching
    * `session._localMediaStream`. Mute state is preserved by mirroring the
    * old track's `enabled` flag onto the new track before replaceTrack.
-   *
-   * `deviceId` may be falsy/'default' — that yields `{ audio: true }` and lets
-   * the browser pick its current default device.
    */
-  async setMicrophone(deviceId) {
+  async _swapMicTrack(audioConstraint) {
     if (!this._currentSession || !this._currentSession.connection) return false
     const pc = this._currentSession.connection
     const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio')
     if (!sender) return false
 
-    const audioConstraint = deviceId && deviceId !== 'default'
-      ? { deviceId: { exact: deviceId } }
-      : true
     let stream
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint, video: false })
@@ -445,6 +484,44 @@ export class SipClient {
       try { oldTrack.stop() } catch { /* ignore */ }
     }
     return true
+  }
+
+  /**
+   * Telemetry snapshot of the live call's upstream audio: the negotiated
+   * send codec (from getStats) and the input track's APPLIED processing
+   * settings — the browser's actual echoCancellation/noiseSuppression/
+   * autoGainControl verdict, which may differ from what the host requested.
+   * Null without a live session.
+   */
+  async getAudioPath() {
+    const pc = this._currentSession?.connection
+    if (!pc) return null
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio')
+    if (!sender) return null
+
+    const out = {}
+    if (sender.track.getSettings) {
+      const s = sender.track.getSettings()
+      out.echo_cancellation = s.echoCancellation ?? null
+      out.noise_suppression = s.noiseSuppression ?? null
+      out.auto_gain_control = s.autoGainControl ?? null
+    }
+    try {
+      const stats = await pc.getStats()
+      let outbound = null
+      stats.forEach((r) => {
+        if (r.type === 'outbound-rtp' && r.kind === 'audio') outbound = r
+      })
+      const codec = outbound?.codecId ? stats.get(outbound.codecId) : null
+      if (codec) {
+        out.codec = codec.mimeType || null // e.g. "audio/opus", "audio/PCMU"
+        out.clock_rate = codec.clockRate ?? null
+        out.fmtp = codec.sdpFmtpLine || null
+      }
+    } catch {
+      /* getStats unavailable — settings alone are still worth reporting */
+    }
+    return out
   }
 
   reject() {

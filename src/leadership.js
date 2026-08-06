@@ -67,6 +67,21 @@ const BYE_NO_INPUT_STAGGER_MS = 5_000
 const VACANCY_STAGGER_MS_PER_SECOND = 250
 const VACANCY_STAGGER_MAX_MS = 30_000
 const NO_INPUT_STAGGER_MS = 45_000 // zero-input tabs go last
+// Health gate: a leader that stays SIP-unregistered this long while idle and
+// online is not coming back (its watchdog has had ≥2 restart cycles by now)
+// — it self-demotes so the bye-succession can move the phone to a tab whose
+// transport works. Leadership alone is worthless without a registration:
+// on 2026-07-30 an alive-and-responsive hidden leader sat unregistered for
+// minutes, answering probes and thereby fending off every candidacy, while
+// inbound calls rang mobiles only.
+const UNHEALTHY_AFTER_MS = 60_000
+// After self-demoting, sit out succession for a while. The demoted tab
+// usually has the freshest lock on "recently was leader" state and would win
+// its own bye race, reconnect on the same broken conditions, and loop. Real
+// user input overrides this — if the user is HERE, this tab is where the
+// phone should be, and a fresh connect() from an input-driven candidacy gets
+// a brand-new socket that may well work.
+const SELF_DEMOTE_COOLDOWN_MS = 30_000
 
 export class LeadershipManager {
   constructor({
@@ -81,6 +96,10 @@ export class LeadershipManager {
     getInputAgeMs = msSinceLastInputRaw,
     getHasEverHadInput = hasEverHadInput,
     subscribeInput = onUserInput,
+    // How many sibling tabs exist (index.js counts them via bc_hello). The
+    // health gate only self-demotes when there is someone to succeed us —
+    // a lone unhealthy tab keeps trying rather than orphaning the phone.
+    getNeighborCount = null,
   }) {
     this._phone = phone
     this._getPhase = getPhase
@@ -91,6 +110,7 @@ export class LeadershipManager {
     this._getInputAgeMs = getInputAgeMs
     this._getHasEverHadInput = getHasEverHadInput
     this._subscribeInput = subscribeInput
+    this._getNeighborCount = getNeighborCount
 
     this._role = 'follower'
     this._leaderHold = null
@@ -111,6 +131,10 @@ export class LeadershipManager {
     this._startedAt = Date.now()
     this._lastLeaderSeenAt = 0
     this._lastLeaderPhase = null
+
+    // Health-gate state (leader side).
+    this._unregisteredSince = null
+    this._selfDemotedAt = 0
   }
 
   get role() {
@@ -238,6 +262,7 @@ export class LeadershipManager {
           to: msg.from,
           phase: this._getPhase(),
           input_age_ms: this._getInputAgeMs(),
+          registered: !!this._phone?.isRegistered,
         })
       } else if (msg.type === 'handoff_request') {
         if (this._getPhase() === 'idle') {
@@ -290,6 +315,7 @@ export class LeadershipManager {
     hold.deposed.then(() => this._onDeposed())
     this._role = 'leader'
     this._lastBroadcastPhase = null
+    this._unregisteredSince = null
     this._startHeartbeat()
     this._report('info', 'leader_acquired', via)
     try { this._onLeader?.() } catch { /* host callback must not break us */ }
@@ -314,7 +340,77 @@ export class LeadershipManager {
       from: this._id,
       phase: this._getPhase(),
       input_age_ms: this._getInputAgeMs(),
+      registered: !!this._phone?.isRegistered,
     })
+    // Piggybacked on the heartbeat: it is the leader's only periodic timer,
+    // and hidden-tab throttling slows both identically (the health window is
+    // wall-clock, so late ticks still cross it).
+    this._checkHealth()
+  }
+
+  /** Leader-side health gate: leadership without a SIP registration is a
+   *  black hole — probes get answered (fending off candidacies) while calls
+   *  ring nobody. When the registration has been gone past the grace and the
+   *  watchdog clearly isn't winning, hand the phone to a tab that can. */
+  _checkHealth() {
+    if (this._role !== 'leader' || this._shutdown) return
+    if (this._phone?.isRegistered) {
+      this._unregisteredSince = null
+      return
+    }
+    // Non-idle phases keep leadership: media can outlive a dead signalling
+    // socket, and never-kill-a-live-call outranks the health gate.
+    if (this._getPhase() !== 'idle') return
+    if (this._unregisteredSince === null) {
+      this._unregisteredSince = Date.now()
+      return
+    }
+    if (Date.now() - this._unregisteredSince < UNHEALTHY_AFTER_MS) return
+    // Offline means every tab would fail the same way — churning leadership
+    // buys nothing; the watchdog retries once the network returns.
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return
+    // A lone tab has nobody to succeed it, so demoting would orphan the phone
+    // outright. That is why this used to bail — but bailing left the black
+    // hole this gate exists to close: on 2026-08-05 exts 7934/7935 sat here
+    // for hours with neighbor_tabs=0, unregistered, answering probes while
+    // every click-to-call was dropped. With no successor the only move left
+    // is to fix ourselves, so kick the transport instead of standing down.
+    if ((this._getNeighborCount?.() ?? 0) < 1) {
+      this._reviveAlone()
+      return
+    }
+    this._selfDemote()
+  }
+
+  /** Sole-tab self-heal: rebuild our own transport rather than hand over.
+   *  Rate-limited by resetting _unregisteredSince, so this retries on the
+   *  same UNHEALTHY_AFTER_MS cadence the demotion path uses rather than
+   *  firing on every heartbeat. */
+  _reviveAlone() {
+    this._report('warn', 'leader_revive_alone', 'unhealthy', {
+      unregistered_ms: Date.now() - (this._unregisteredSince || Date.now()),
+    })
+    this._unregisteredSince = null
+    try {
+      this._phone?.reviveTransport?.()
+    } catch { /* best effort — the watchdog is still running underneath */ }
+  }
+
+  _selfDemote() {
+    this._report('warn', 'leader_released', 'unhealthy', {
+      unregistered_ms: Date.now() - (this._unregisteredSince || Date.now()),
+      neighbor_tabs: this._getNeighborCount?.() ?? null,
+    })
+    this._selfDemotedAt = Date.now()
+    this._unregisteredSince = null
+    // Same shape as shutdown's succession kick: bye first so followers race
+    // immediately, then teardown + release so the winner's lock grab finds
+    // it free (and steals if the release is still in flight).
+    this._send({ type: 'lead_bye', from: this._id })
+    this._demote()
+    this._phone.stopSip()
+    this._leaderHold?.release()
+    this._leaderHold = null
   }
 
   _demote() {
@@ -372,6 +468,13 @@ export class LeadershipManager {
 
   async _startCandidacy(trigger, { stealCandidateLock = false } = {}) {
     if (this._shutdown || this._role !== 'follower' || this._candidate) return
+    // A freshly self-demoted tab sits out silence/bye races — it would win
+    // on recency and loop right back into the same broken transport. Real
+    // user input here overrides the cooldown: the phone belongs with the
+    // user, and an input-driven candidacy rebuilds the stack from scratch.
+    if (trigger.startsWith('vacancy') &&
+        this._selfDemotedAt &&
+        Date.now() - this._selfDemotedAt < SELF_DEMOTE_COOLDOWN_MS) return
     const hold = requestHold(CANDIDATE_LOCK, {
       ifAvailable: !stealCandidateLock,
       steal: stealCandidateLock,
@@ -416,10 +519,17 @@ export class LeadershipManager {
       if (this._cancelled(candidate)) return
 
       if (pong) {
-        // A vacancy/bye race that found a live leader stands down — only an
-        // input-driven candidacy (input/yield) may displace a healthy leader.
-        if (trigger.startsWith('vacancy')) return this._abortCandidacy('leader_alive')
-        if (typeof pong.input_age_ms === 'number' && pong.input_age_ms < INPUT_FRESH_MS) {
+        // A vacancy/bye race that found a live leader stands down — unless
+        // the leader admits its registration is gone: alive-but-unregistered
+        // is exactly the black hole the health gate exists for, and its own
+        // self-demotion may be a broken build away. `!== false` keeps the
+        // old deference for pre-health-gate leaders that don't send the flag.
+        const unhealthy = pong.registered === false
+        if (trigger.startsWith('vacancy') && !unhealthy) {
+          return this._abortCandidacy('leader_alive')
+        }
+        if (!unhealthy &&
+            typeof pong.input_age_ms === 'number' && pong.input_age_ms < INPUT_FRESH_MS) {
           // The user is at the leader right now — no point moving it.
           return this._abortCandidacy('leader_active')
         }

@@ -12,6 +12,11 @@ vi.mock('../src/sip-client.js', () => ({
       this.reject = vi.fn()
       this.sendDTMF = vi.fn()
       this.currentSession = null
+      // Mirrors the real SipClient getters. A connected transport is the
+      // normal case these tests exercise; phone.call() branches on this to
+      // decide whether a dial needs a transport rebuild first.
+      this.isConnected = true
+      this.hasUA = true
     }
   },
 }))
@@ -432,5 +437,91 @@ describe('Leadtodeed()', () => {
       phone.emit('callConnected', { number: '+44555' })
       phone.emit('callEnded', { number: '+44555', duration: 10, cause: 'completed' })
     }).not.toThrow()
+  })
+})
+
+// A click-to-call from a tab whose transport has died used to be swallowed
+// whole: no INVITE, no PBX StasisStart, no error (2026-08-05 exts 7934/7935,
+// 16 dials lost in one afternoon). The dial now outranks the watchdog backoff.
+describe('LeadtodeedPhone dial revival', () => {
+  const defaults = { subdomain: 'example', tokenUrl: '/api/token' }
+
+  it('dials straight away when the socket is up, even if unregistered', () => {
+    const phone = new LeadtodeedPhone(defaults)
+    phone._registered = false
+    phone._sip.isConnected = true
+
+    phone.call('+1234567890')
+
+    // No rebuild: a live socket usually carries the INVITE fine, and
+    // _registered is routinely a stale false.
+    expect(phone._sip.call).toHaveBeenCalledWith('+1234567890')
+    expect(phone._sip.disconnect).not.toHaveBeenCalled()
+  })
+
+  it('rebuilds the transport before dialling when the socket is down', async () => {
+    const phone = new LeadtodeedPhone(defaults)
+    phone._registered = false
+    phone._sip.isConnected = false
+    phone._lastRegisteredAt = Date.now()
+    // Stand in for a real reconnect: connect() lands the registration.
+    phone.connect = vi.fn(async () => { phone._registered = true })
+
+    phone.call('+1234567890')
+    await vi.waitFor(() => expect(phone._sip.call).toHaveBeenCalledWith('+1234567890'))
+
+    expect(phone._sip.disconnect).toHaveBeenCalled()
+    expect(phone.connect).toHaveBeenCalled()
+  })
+
+  it('ignores the watchdog backoff — the user outranks the ladder', async () => {
+    const phone = new LeadtodeedPhone(defaults)
+    phone._registered = false
+    phone._sip.isConnected = false
+    // Backed off to the 5-minute ceiling after repeated failures, and
+    // restarted moments ago: the watchdog would not touch this for minutes.
+    phone._watchdogRestartCount = 10
+    phone._watchdogLastRestartAt = Date.now()
+    phone.connect = vi.fn(async () => { phone._registered = true })
+
+    phone.call('+1234567890')
+    await vi.waitFor(() => expect(phone._sip.call).toHaveBeenCalledWith('+1234567890'))
+
+    expect(phone.connect).toHaveBeenCalled()
+    expect(phone._watchdogRestartCount).toBe(0)
+  })
+
+  it('still dials if the revive never registers, rather than dropping it', async () => {
+    vi.useFakeTimers()
+    try {
+      const phone = new LeadtodeedPhone(defaults)
+      phone._registered = false
+      phone._sip.isConnected = false
+      phone.connect = vi.fn(async () => { /* never registers */ })
+
+      phone.call('+1234567890')
+      await vi.advanceTimersByTimeAsync(7_000)
+
+      // A doomed INVITE beats a silent drop: Asterisk authenticates on its
+      // own digest and may well accept from a contact it still holds.
+      expect(phone._sip.call).toHaveBeenCalledWith('+1234567890')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('abandons the revive if an inbound call took the phone meanwhile', async () => {
+    const phone = new LeadtodeedPhone(defaults)
+    phone._registered = false
+    phone._sip.isConnected = false
+    phone.connect = vi.fn(async () => {
+      phone._registered = true
+      phone._sip.currentSession = {} // inbound answered during the rebuild
+    })
+
+    phone.call('+1234567890')
+    await vi.waitFor(() => expect(phone.connect).toHaveBeenCalled())
+
+    expect(phone._sip.call).not.toHaveBeenCalled()
   })
 })

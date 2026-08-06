@@ -66,10 +66,26 @@ const WATCHDOG_SUSPEND_GAP_MS = 120_000
 const WATCHDOG_SOCKET_DEAD_GAP_MS = 75_000
 // ≥2 missed REGISTER refreshes at register_expires=60.
 const REGISTRATION_STALE_MS = 150_000
+// A transport that has been down this long with no reconnect is not coming
+// back on its own — JsSIP's recovery timers are throttled to 1/min in hidden
+// tabs and observed to never fire at all after some closes. Without this
+// check the watchdog is blind to socket death: a restart whose REGISTER
+// succeeds resets the registration age, and when the fresh socket dies
+// seconds later the age-based check stands down for the full
+// REGISTRATION_STALE_MS while Asterisk holds a 60s contact to a corpse
+// (2026-07-30 ext 7172: socket died 1.7s after a successful watchdog
+// restart; no reconnect for 2 minutes until the user opened a new tab).
+const WATCHDOG_SOCKET_DOWN_MS = 10_000
 // Backoff between restarts that fail to bring the registration back — reset
 // by the next successful REGISTER.
 const WATCHDOG_RESTART_BASE_MS = 30_000
 const WATCHDOG_RESTART_MAX_MS = 300_000
+// How long a user-initiated dial waits for the revived transport to REGISTER
+// before dialling regardless. Deliberately under the call controller's 10s
+// no-progress watch: the dial must reach JsSIP while that watch is still
+// armed, or the controller paints "Couldn't place call" over a call that is
+// in fact about to go out.
+const DIAL_REVIVE_TIMEOUT_MS = 6_000
 
 // Generate a random session identifier. Prefer crypto.randomUUID when
 // available (all evergreen browsers + HTTPS contexts); otherwise fall back
@@ -125,6 +141,7 @@ export class LeadtodeedPhone extends EventEmitter {
 
     // Watchdog state (see constants at the top of this file)
     this._lastRegisteredAt = null
+    this._lastWsClosedAt = null
     this._watchdogTimer = null
     this._watchdogVisHandler = null
     this._watchdogPageshowHandler = null
@@ -150,6 +167,7 @@ export class LeadtodeedPhone extends EventEmitter {
     this._sip = new SipClient({
       getAudioConstraints,
       onWsOpened: () => {
+        this._lastWsClosedAt = null
         // First opportunity where sip._ua.configuration.via_host is populated.
         // Publish it into the reporter so ALL subsequent events — including
         // heartbeats and error reports — carry this JsSIP UA's stable id.
@@ -197,6 +215,7 @@ export class LeadtodeedPhone extends EventEmitter {
       onNewSession: (session, meta) => this._handleSession(session, meta),
       onDisconnected: (e) => {
         this._registered = false
+        this._lastWsClosedAt = Date.now()
         this._reporter.report('warn', 'sip_ws_closed', e?.reason || '', {
           code: e?.code ?? null,
           was_clean: e?.was_clean ?? null,
@@ -395,7 +414,14 @@ export class LeadtodeedPhone extends EventEmitter {
     //    this, a 60–150s sleep woke into JsSIP refreshing over the corpse
     //    and a Timer F (32s) "Request Timeout" before recovery.
     const presumeDead = sleepGapMs > WATCHDOG_SOCKET_DEAD_GAP_MS
-    if (!presumeDead && registeredAgoMs < REGISTRATION_STALE_MS) return
+    // Third trigger: the transport is verifiably down and stayed down. This
+    // is independent of registration age on purpose — a successful restart
+    // resets the age, so a socket that dies right after would otherwise put
+    // the watchdog back to sleep for REGISTRATION_STALE_MS.
+    const socketDown = this._sip.hasUA && !this._sip.isConnected &&
+      this._lastWsClosedAt !== null &&
+      Date.now() - this._lastWsClosedAt > WATCHDOG_SOCKET_DOWN_MS
+    if (!presumeDead && !socketDown && registeredAgoMs < REGISTRATION_STALE_MS) return
     // No network at all (fresh wake from sleep) — cycling the transport now
     // just burns the backoff budget; the next tick retries once online.
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return
@@ -410,6 +436,7 @@ export class LeadtodeedPhone extends EventEmitter {
       registered_ago_ms: registeredAgoMs,
       sleep_gap_ms: Math.round(sleepGapMs),
       presumed_dead: presumeDead,
+      socket_down: socketDown,
       // JsSIP's belief — expected to be a stale `true` in the zombie case.
       registered: this._registered,
       restart_count: this._watchdogRestartCount,
@@ -460,6 +487,23 @@ export class LeadtodeedPhone extends EventEmitter {
 
     this._callNumber = number.replace(/[^\d+]/g, '')
 
+    // Dialling into a dead transport is the 2026-08-05 ext 7934/7935
+    // pathology: the INVITE goes nowhere, the PBX logs no StasisStart, and
+    // the agent gets a button that does nothing. Gate on the SOCKET, not on
+    // _registered: that flag is routinely a stale false while the line still
+    // works (Asterisk kept those contacts Available throughout), and making
+    // every such dial pay for a teardown would trade a broken button for a
+    // slow one. A live socket gets its INVITE immediately; only a verifiably
+    // down one is worth rebuilding first.
+    if (!this._registered && !this._sip.isConnected) {
+      this._dialAfterRevive(this._callNumber)
+      return
+    }
+
+    this._placeInvite()
+  }
+
+  _placeInvite() {
     try {
       this._sip.call(this._callNumber)
       this.emit('callStarted', { number: this._callNumber, direction: 'outgoing' })
@@ -468,12 +512,93 @@ export class LeadtodeedPhone extends EventEmitter {
     }
   }
 
+  /** A user-initiated dial outranks the watchdog's backoff ladder. By the
+   *  time an agent complains, restart_count has usually climbed far enough
+   *  that the cooldown is minutes long (WATCHDOG_RESTART_MAX_MS), so the tab
+   *  sits unregistered and every click is silently dropped. The user being
+   *  HERE is the strongest evidence this tab is where the phone belongs —
+   *  the same reasoning leadership.js already applies to input-driven
+   *  candidacy — so rebuild the transport now rather than waiting our turn. */
+  async _dialAfterRevive(number) {
+    const startedAt = Date.now()
+    this._reporter.report('warn', 'dial_revive_started', '', {
+      socket_connected: this._sip.isConnected,
+      restart_count: this._watchdogRestartCount,
+    })
+    // This restart is user-driven, not another automatic retry: it must
+    // neither be delayed by the ladder nor charged against it.
+    this._watchdogRestartCount = 0
+    this._watchdogLastRestartAt = Date.now()
+    try {
+      if (!this._watchdogRestarting) await this._watchdogRestart()
+      await this._waitForRegistered(DIAL_REVIVE_TIMEOUT_MS)
+    } catch { /* fall through to the unregistered check below */ }
+
+    // The user may have hung up, dialled again, or an inbound call may have
+    // landed while we were rebuilding — any of those owns the phone now.
+    if (this.isInCall || this._callNumber !== number) {
+      this._reporter.report('warn', 'dial_revive_abandoned', '', {
+        elapsed_ms: Date.now() - startedAt,
+      })
+      return
+    }
+    if (!this._registered) {
+      this._reporter.report('error', 'dial_revive_failed', '', {
+        elapsed_ms: Date.now() - startedAt,
+        socket_connected: this._sip.isConnected,
+      })
+      // Dial anyway. Asterisk authenticates the INVITE on its own digest and
+      // will accept one from a contact it still considers valid, so a stale
+      // `registered=false` is not proof the line is dead — and a doomed
+      // INVITE is still strictly better than the silent drop it replaced.
+      this._placeInvite()
+      return
+    }
+    this._reporter.report('info', 'dial_revive_ok', '', {
+      elapsed_ms: Date.now() - startedAt,
+    })
+    this._placeInvite()
+  }
+
+  /** Force an immediate transport rebuild, bypassing the backoff ladder.
+   *  For callers outside the watchdog that have their own reason to believe
+   *  waiting is pointless — today the sole-tab health gate in leadership.js,
+   *  which has no successor to hand the phone to and so must repair in
+   *  place. Fire-and-forget: the 'registered' handler resets the backoff. */
+  reviveTransport() {
+    if (this._watchdogRestarting || this.isInCall) return
+    this._watchdogRestartCount = 0
+    this._watchdogLastRestartAt = Date.now()
+    this._watchdogRestart()
+  }
+
+  /** Resolve once REGISTER lands, or after timeoutMs regardless. Polled
+   *  rather than event-driven: the 'registered' handler is several layers
+   *  down in SipClient and a missed edge here would hang the dial. */
+  async _waitForRegistered(timeoutMs) {
+    const deadline = Date.now() + timeoutMs
+    while (!this._registered && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    return this._registered
+  }
+
   hangup() {
     this._sip.hangup()
   }
 
+  /** Returns true when a session was actually answered. False means the
+   *  ring the user clicked was a ghost — the UI rang (broadcast/state
+   *  driven) but this tab holds no SIP session. Loud on purpose: this
+   *  exact silence hid the dead-leader pathology for months. */
   answer() {
-    this._sip.answer()
+    const ok = this._sip.answer()
+    if (!ok) {
+      this._reporter.report('warn', 'accept_no_session', '', {
+        registered: this._registered,
+      })
+    }
+    return ok
   }
 
   reject() {
@@ -519,6 +644,22 @@ export class LeadtodeedPhone extends EventEmitter {
    */
   setMicrophone(deviceId) {
     return this._sip.setMicrophone(deviceId)
+  }
+
+  /**
+   * Re-read the host's `getAudioConstraints()` and swap the active call's mic
+   * track to match — how a processing-flag toggle (noise suppression etc.)
+   * lands mid-call. No-op false without a live session; the next
+   * call/answer picks the flags up anyway.
+   */
+  refreshAudioConstraints() {
+    return this._sip.refreshAudioConstraints()
+  }
+
+  /** Live call's send codec + applied mic processing settings for telemetry;
+   *  null when idle. */
+  getAudioPath() {
+    return this._sip.getAudioPath()
   }
 
   get isMuted() {

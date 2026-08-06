@@ -45,6 +45,9 @@ function makeFakePhone(name, log) {
     isInCall: false,
     registered: false,
     connected: false,
+    // The health gate reads the real phone's isRegistered getter; mirror the
+    // fake's plain `registered` flag through the same name.
+    get isRegistered() { return this.registered },
     connect: vi.fn(async (opts = {}) => {
       log.push(`${name}.connect(register=${opts.register !== false})`)
       phone.connected = true
@@ -52,6 +55,13 @@ function makeFakePhone(name, log) {
     }),
     register: vi.fn(async () => {
       log.push(`${name}.register`)
+      phone.registered = true
+    }),
+    // Sole-tab self-heal: a lone unhealthy leader has no successor, so it
+    // rebuilds its own transport instead of demoting into a vacuum.
+    reviveTransport: vi.fn(() => {
+      log.push(`${name}.reviveTransport`)
+      phone.connected = true
       phone.registered = true
     }),
     stopSip: vi.fn(() => {
@@ -67,7 +77,7 @@ function makeFakePhone(name, log) {
   return phone
 }
 
-function makeTab(name, log) {
+function makeTab(name, log, managerOpts = {}) {
   const phone = makeFakePhone(name, log)
   const inputSubs = []
   const tab = {
@@ -75,11 +85,23 @@ function makeTab(name, log) {
     phone,
     phase: 'idle',
     inputAt: 0,
-    // "Freeze": the tab stops sending and receiving protocol messages, like
-    // a Safari-suspended page. Locks stay held — exactly the failure mode.
+    // "Freeze": the tab stops sending and receiving protocol messages AND
+    // running its periodic timers, like a Safari-suspended page. Locks stay
+    // held — exactly the failure mode. (Without stopping the timers a
+    // "frozen" follower keeps its vacancy watch, goes deaf-but-active, and
+    // steals from a healthy leader — a behaviour no real suspended tab has.)
     freeze() {
       this.manager._send = () => {}
       if (this.manager._channel) this.manager._channel.onmessage = null
+      this.manager._stopHeartbeat()
+      if (this.manager._vacancyTimer) {
+        clearInterval(this.manager._vacancyTimer)
+        this.manager._vacancyTimer = null
+      }
+      if (this.manager._vacancyClaimTimer) {
+        clearTimeout(this.manager._vacancyClaimTimer)
+        this.manager._vacancyClaimTimer = null
+      }
     },
     input() {
       this.inputAt = Date.now()
@@ -96,6 +118,7 @@ function makeTab(name, log) {
       inputSubs.push(fn)
       return () => {}
     },
+    ...managerOpts,
   })
   return tab
 }
@@ -391,5 +414,121 @@ describe('LeadershipManager', () => {
     await b.manager.start()
     await settle()
     expect(b.manager.role).toBe('leader')
+  })
+
+  // --- Health gate (2026-07-30 ext 7172: alive leader, dead registration) ---
+
+  it('an unregistered idle leader self-demotes and a sibling succeeds on the bye', async () => {
+    const a = makeTab('A', log, { getNeighborCount: () => 1 })
+    const b = makeTab('B', log)
+    await a.manager.start()
+    await b.manager.start()
+    await settle()
+    expect(a.manager.role).toBe('leader')
+
+    a.phone.registered = false // transport rotted; watchdog not winning
+    await vi.advanceTimersByTimeAsync(75_000)
+
+    expect(a.manager.role).toBe('follower')
+    expect(a.phone.stopSip).toHaveBeenCalled()
+
+    // B never had input → it claims on the bye after the last-resort stagger.
+    await vi.advanceTimersByTimeAsync(7_000)
+    expect(b.manager.role).toBe('leader')
+    expect(b.phone.registered).toBe(true)
+  })
+
+  it('a lone unhealthy leader keeps leadership — no one to succeed it', async () => {
+    const a = makeTab('A', log, { getNeighborCount: () => 0 })
+    await a.manager.start()
+    await settle()
+
+    a.phone.registered = false
+    await vi.advanceTimersByTimeAsync(300_000)
+
+    expect(a.manager.role).toBe('leader')
+    expect(a.phone.stopSip).not.toHaveBeenCalled()
+  })
+
+  it('a lone unhealthy leader repairs itself instead of standing down', async () => {
+    const a = makeTab('A', log, { getNeighborCount: () => 0 })
+    await a.manager.start()
+    await settle()
+
+    a.phone.registered = false
+    a.phone.connected = false
+    await vi.advanceTimersByTimeAsync(300_000)
+
+    // Keeping leadership while unregistered is only defensible if we are
+    // actively trying to fix it. Standing pat is the black hole this gate
+    // exists to close: probes answered, calls dropped (exts 7934/7935).
+    expect(a.phone.reviveTransport).toHaveBeenCalled()
+    expect(a.manager.role).toBe('leader')
+  })
+
+  it('a lone leader that is registered is left alone', async () => {
+    const a = makeTab('A', log, { getNeighborCount: () => 0 })
+    await a.manager.start()
+    await settle()
+
+    await vi.advanceTimersByTimeAsync(300_000)
+
+    expect(a.phone.reviveTransport).not.toHaveBeenCalled()
+  })
+
+  it('an in-call leader is never health-demoted, even unregistered', async () => {
+    const a = makeTab('A', log, { getNeighborCount: () => 1 })
+    const b = makeTab('B', log)
+    await a.manager.start()
+    await b.manager.start()
+    await settle()
+
+    a.phase = 'connected' // media can outlive the signalling socket
+    a.phone.registered = false
+    await vi.advanceTimersByTimeAsync(300_000)
+
+    expect(a.manager.role).toBe('leader')
+  })
+
+  it('fresh input at an unregistered leader does not fend off a candidacy', async () => {
+    const a = makeTab('A', log)
+    const b = makeTab('B', log)
+    await a.manager.start()
+    await b.manager.start()
+    await settle()
+
+    a.phone.registered = false
+    a.input() // user typing at the broken leader — would abort a candidacy if healthy
+    b.input()
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    expect(b.manager.role).toBe('leader')
+    expect(a.manager.role).toBe('follower')
+  })
+
+  it('a self-demoted tab sits out the vacancy race, then recovers as last resort', async () => {
+    const a = makeTab('A', log, { getNeighborCount: () => 1 })
+    const b = makeTab('B', log)
+    await a.manager.start()
+    await b.manager.start()
+    await settle()
+    b.freeze() // a sibling exists but can never claim
+
+    a.phone.registered = false
+    // Input while still leader: no candidacy side effect, but it keeps the
+    // later vacancy stagger short — the claims we assert get blocked by the
+    // cooldown, not by the no-input last-resort stagger.
+    await vi.advanceTimersByTimeAsync(50_000)
+    a.input()
+    await vi.advanceTimersByTimeAsync(25_000) // demotion lands in [60s, 70s]
+
+    // Demoted, and the silence-vacancy claims it would win are blocked by
+    // the post-demotion cooldown.
+    expect(a.manager.role).toBe('follower')
+
+    // Once the cooldown lapses and the leadership is still vacant, the
+    // demoted tab is allowed back in rather than orphaning the phone.
+    await vi.advanceTimersByTimeAsync(85_000)
+    expect(a.manager.role).toBe('leader')
   })
 })

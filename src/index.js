@@ -36,9 +36,10 @@ const NEIGHBOR_PING_INTERVAL_MS = 30_000
  * @param {string} config.tokenUrl - Token endpoint path
  * @param {Function} [config.renderer] - (state) => void — called on every state change
  * @param {Function} [config.onIncomingCall] - async (callerNumber) => enrichmentData | null
+ * @param {Function} [config.onInviteFailed] - ({user_id, name, extension, reason}) => void — an add-participant invite resolved without a join. `reason` is "no_answer" (ring timeout) or "cancelled" (inviter withdrew it). Fired on every widget tied to the bridge, not just the inviter's.
  * @param {string} [config.ringtoneUrl] - URL to an .ogg ringtone played on incoming calls
  * @param {{play: Function, stop: Function}} [config.ringtonePlayer] - Custom ringtone player (overrides ringtoneUrl). Use to play via AudioContext so macOS doesn't show Now Playing.
- * @param {Function} [config.getAudioConstraints] - () => audio getUserMedia constraint (typically `{ deviceId: { exact: '<id>' } }`). Called fresh on every call()/answer() so a host-side mic-picker change applies to the next call. Return nullish to use the browser default.
+ * @param {Function} [config.getAudioConstraints] - () => audio getUserMedia constraint (typically `{ deviceId: { exact: '<id>' } }`, optionally with echoCancellation/noiseSuppression/autoGainControl flags). Called fresh on every call()/answer() so a host-side mic-picker or processing-toggle change applies to the next call. Return nullish to use the browser default.
  * @returns {LeadtodeedPhone} The phone instance
  */
 export default function Leadtodeed({
@@ -46,6 +47,7 @@ export default function Leadtodeed({
   tokenUrl,
   renderer = null,
   onIncomingCall = null,
+  onInviteFailed = null,
   ringtoneUrl = null,
   ringtonePlayer = null,
   // Max telemetry reports per minute per tab. Default 600 (= 10/sec); set
@@ -106,6 +108,9 @@ export default function Leadtodeed({
       // the host should still persist the choice and `getAudioConstraints`
       // will pick it up on the next call/answer.
       setMicrophone: (deviceId) => phone.setMicrophone(deviceId),
+      // Re-apply the host's getAudioConstraints() to the active call (mic
+      // processing-flag toggles). Same idle contract as setMicrophone.
+      refreshAudioConstraints: () => phone.refreshAudioConstraints(),
     })
   }
 
@@ -191,11 +196,18 @@ export default function Leadtodeed({
         notify()
       },
       onParticipantInviteFailed: (data) => {
-        // Invite resolved without a join (timeout or cancellation). The
-        // invitee was never in `participants` — they were a "Connecting…"
-        // placeholder in the controller's _pendingParticipants. Clear
-        // both to be defensive: if the controller already removed it
-        // (optimistic on cancel click), the filters below are no-ops.
+        // Invite resolved without a join. `data.reason` is the server's
+        // account of why ("no_answer" | "cancelled") — the host labels its
+        // retry affordance from it, so pass the payload through verbatim
+        // rather than collapsing it to a participants mutation.
+        //
+        // Host first, then notify: the host's handler is what records the
+        // failure, so the render that follows paints the resolved state in
+        // one pass instead of flashing an un-resolved row.
+        //
+        // The invitee was never in `participants` — they were a "Connecting…"
+        // placeholder held by the host. The filter is defensive only.
+        onInviteFailed?.(data)
         state.participants = state.participants.filter(p => p.user_id !== data.user_id)
         notify()
       },
@@ -379,6 +391,10 @@ export default function Leadtodeed({
   leadership = new LeadershipManager({
     phone,
     getPhase: () => state.phase,
+    // Health gate: an unregistered leader only self-demotes when a sibling
+    // exists to succeed it. The bc_hello census is eventually consistent
+    // (30s ping cycle) — good enough, the gate itself waits 60s.
+    getNeighborCount: () => neighborSessions.size,
     onLeader: () => _connectCallEventsWS(),
     onFollower: () => {
       // Only the leader may hold the events WS (single-socket budget).

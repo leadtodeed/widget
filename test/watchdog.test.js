@@ -154,6 +154,42 @@ describe('SIP registration watchdog', () => {
     phone._stopWatchdog()
   })
 
+  it('restarts when the socket dies and stays down, even with a fresh registration', () => {
+    const { phone, reports, connectSpy } = makePhone()
+    phone._startWatchdog()
+    simulateRegistered(phone)
+
+    // Socket death seconds after a successful (re-)REGISTER — the 2026-07-30
+    // ext 7172 shape. The age-based check alone would sleep for 150s while
+    // Asterisk holds a 60s contact pointing at the corpse.
+    phone._sip._ua = { isConnected: () => false, isRegistered: () => false }
+    phone._sip._callbacks.onDisconnected({ code: null, reason: '', was_clean: null, duration_ms: 1710 })
+
+    vi.advanceTimersByTime(15_000) // first tick past the 10s socket-down grace
+
+    expect(connectSpy).toHaveBeenCalledTimes(1)
+    const stale = eventsOf(reports, 'sip_watchdog_stale')
+    expect(stale).toHaveLength(1)
+    expect(stale[0].context.socket_down).toBe(true)
+    expect(stale[0].context.registered_ago_ms).toBeLessThan(150_000)
+    phone._stopWatchdog()
+  })
+
+  it('a socket that reopens clears the socket-down trigger', () => {
+    const { phone, connectSpy } = makePhone()
+    phone._startWatchdog()
+    simulateRegistered(phone)
+
+    phone._sip._ua = { isConnected: () => true, isRegistered: () => true }
+    phone._sip._callbacks.onDisconnected({ code: 1006, reason: '', was_clean: false, duration_ms: 500 })
+    phone._sip._callbacks.onWsOpened() // JsSIP recovery won this time
+
+    vi.advanceTimersByTime(60_000)
+
+    expect(connectSpy).not.toHaveBeenCalled()
+    phone._stopWatchdog()
+  })
+
   it('disconnect() stops the watchdog', () => {
     const { phone, connectSpy } = makePhone()
     phone._startWatchdog()
