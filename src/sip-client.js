@@ -296,20 +296,51 @@ export class SipClient {
     }
 
     this._ua = new JsSIP.UA(configuration)
-    this._wsOpenedAt = null
+    this._attachUaHandlers(this._ua)
+    this._ua.start()
+  }
 
-    this._ua.on('connected', () => {
-      this._wsOpenedAt = Date.now()
+  /**
+   * Wire one UA generation's events to the host callbacks.
+   *
+   * Every handler is guarded on `ua === this._ua`, and the socket's open time
+   * is a local of this call rather than a field on the client, because UA
+   * generations OVERLAP. `stop()` is asynchronous: JsSIP un-REGISTERs, drains
+   * its transactions and only then closes the socket, so a UA that connect()
+   * has already replaced goes on to emit `disconnected` a second or two later.
+   *
+   * Unguarded, that late event ran against the CURRENT UA's state. It read the
+   * new socket's open time — reporting a ~1.6s lifetime for a socket that was
+   * perfectly healthy — nulled the shared field so the next genuine close
+   * reported duration_ms=null, and flipped the phone's `_registered` to false
+   * on a live registration. The leader health gate then tore that working
+   * registration down 60s later, and leadership churned into the same cycle.
+   *
+   * Measured 2026-08-21 before the guard: 42% of ALL watchdog restarts fleet
+   * wide ended this way (85% for the worst extension). Half of the contacts
+   * "closed" this way outlived Asterisk's 60s lease, which is only possible if
+   * REGISTER refreshes kept landing, and Asterisk's own transport log has no
+   * close at the moment the widget reported one. The socket never died.
+   */
+  _attachUaHandlers(ua) {
+    // Per-generation, so a late event cannot read or clobber its successor's.
+    let wsOpenedAt = null
+    const current = () => this._ua === ua
+
+    ua.on('connected', () => {
+      if (!current()) return
+      wsOpenedAt = Date.now()
       this._callbacks.onWsOpened?.()
     })
-    this._ua.on('registered', () => this._callbacks.onRegistered?.())
-    this._ua.on('unregistered', () => this._callbacks.onUnregistered?.())
-    this._ua.on('registrationFailed', (e) => this._callbacks.onRegistrationFailed?.(e))
-    this._ua.on('disconnected', (e) => {
+    ua.on('registered', () => { if (current()) this._callbacks.onRegistered?.() })
+    ua.on('unregistered', () => { if (current()) this._callbacks.onUnregistered?.() })
+    ua.on('registrationFailed', (e) => { if (current()) this._callbacks.onRegistrationFailed?.(e) })
+    ua.on('disconnected', (e) => {
       // `disconnected` fires with a reason/code object on abrupt closes.
       // Pass through so callers can report code/reason/duration.
-      const durationMs = this._wsOpenedAt ? (Date.now() - this._wsOpenedAt) : null
-      this._wsOpenedAt = null
+      if (!current()) return
+      const durationMs = wsOpenedAt ? (Date.now() - wsOpenedAt) : null
+      wsOpenedAt = null
       this._callbacks.onDisconnected?.({
         code: e?.code ?? null,
         reason: e?.reason ?? null,
@@ -317,9 +348,7 @@ export class SipClient {
         duration_ms: durationMs,
       })
     })
-    this._ua.on('newRTCSession', (e) => this._handleNewSession(e))
-
-    this._ua.start()
+    ua.on('newRTCSession', (e) => { if (current()) this._handleNewSession(e) })
   }
 
   disconnect() {
@@ -329,8 +358,13 @@ export class SipClient {
       this._currentSession = null
     }
     if (this._ua) {
-      this._ua.stop()
+      // Drop our reference FIRST: the handlers attached in _attachUaHandlers
+      // guard on `ua === this._ua`, so clearing it here disowns this
+      // generation's events the moment we ask it to stop, rather than
+      // whenever its socket finally gets round to closing.
+      const ua = this._ua
       this._ua = null
+      ua.stop()
     }
   }
 
