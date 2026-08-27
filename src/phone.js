@@ -34,7 +34,7 @@
 
 import { EventEmitter } from './events.js'
 import { AuthManager } from './auth.js'
-import { SipClient } from './sip-client.js'
+import { SipClient, decodeB64Header } from './sip-client.js'
 import { Reporter } from './reporter.js'
 
 // --- SIP registration watchdog ---
@@ -134,6 +134,15 @@ export class LeadtodeedPhone extends EventEmitter {
     })
     this._callNumber = null
     this._callStartedAt = null
+    // Caller ID this call asked to assert (E.164), or null for "whatever the
+    // server picks". Set by call(), read by _placeInvite — so a dial that has
+    // to revive the transport first still asserts the number the user clicked.
+    this._callClid = null
+    // Resolved server-side and echoed back on the 183/200 — the line this call
+    // is going out on, and its human label ("Acme Legal"). Null until the
+    // response arrives, and for inbound calls (which carry did/didLabel instead).
+    this._outboundClid = null
+    this._outboundLabel = null
     this._registered = false
     this._callUuid = null
     this._bridgeId = null
@@ -471,7 +480,17 @@ export class LeadtodeedPhone extends EventEmitter {
     }
   }
 
-  call(number) {
+  /**
+   * Place an outgoing call.
+   *
+   * `callerId` is the number to assert as caller ID on this call, in E.164.
+   * It is a REQUEST, not a guarantee: the server validates it against the
+   * numbers the tenant actually owns, and rejects the call outright if it does
+   * not (an `outbound_rejected` call-event plus a SIP rejection) rather than
+   * silently substituting another number. Omit it to let the server pick the
+   * per-user default.
+   */
+  call(number, { callerId = null } = {}) {
     if (!number) return
     // Defense-in-depth against duplicate dial. SipClient sets _currentSession
     // synchronously inside _ua.call(), so a back-to-back call() in the same
@@ -486,6 +505,14 @@ export class LeadtodeedPhone extends EventEmitter {
     }
 
     this._callNumber = number.replace(/[^\d+]/g, '')
+    // Deliberately NOT put through the strip above: that one sanitises a
+    // human-typed destination, and applying it to a caller ID could silently
+    // truncate it into a different, valid-looking number. A malformed value is
+    // better dropped whole — the server would reject it anyway.
+    this._callClid = /^\+?[0-9]{6,20}$/.test(String(callerId || '')) ? callerId : null
+    if (callerId && !this._callClid) {
+      this._reporter.report('warn', 'caller_id_ignored', 'malformed')
+    }
 
     // Dialling into a dead transport is the 2026-08-05 ext 7934/7935
     // pathology: the INVITE goes nowhere, the PBX logs no StasisStart, and
@@ -505,8 +532,18 @@ export class LeadtodeedPhone extends EventEmitter {
 
   _placeInvite() {
     try {
-      this._sip.call(this._callNumber)
-      this.emit('callStarted', { number: this._callNumber, direction: 'outgoing' })
+      // Only pass options when there is something to say. A dial with no
+      // caller ID must reach SipClient byte-identically to before this feature
+      // existed — that is what makes the widget safe to ship ahead of the
+      // server and host-app halves.
+      if (this._callClid) {
+        this._sip.call(this._callNumber, { extraHeaders: [`X-Clid: ${this._callClid}`] })
+      } else {
+        this._sip.call(this._callNumber)
+      }
+      this.emit('callStarted', {
+        number: this._callNumber, direction: 'outgoing', callerId: this._callClid
+      })
     } catch (e) {
       this.emit('error', e)
     }
@@ -748,13 +785,37 @@ export class LeadtodeedPhone extends EventEmitter {
       this.emit('callStarted', { number: this._callNumber, direction })
     })
 
-    session.on('progress', () => {
-      this.emit('callProgress', { number: this._callNumber })
+    // The server echoes back which line the call actually went out on, so
+    // the UI can say "via <brand>" on outgoing calls the same way it already
+    // does on incoming ones. It rides the SIP RESPONSE (183/200), not the
+    // request — the caller ID is only resolved server-side, after our INVITE.
+    // Absent headers mean the server had no label for the number, which is
+    // normal; the caller renders nothing rather than guessing.
+    const readOutbound = (e) => {
+      const clid = e?.response?.getHeader?.('X-Clid') || null
+      const label = decodeB64Header(e?.response?.getHeader?.('X-Did-Label-B64'))
+      if (clid) this._outboundClid = clid
+      if (label) this._outboundLabel = label
+    }
+
+    session.on('progress', (e) => {
+      readOutbound(e)
+      this.emit('callProgress', {
+        number: this._callNumber,
+        outboundClid: this._outboundClid,
+        outboundLabel: this._outboundLabel,
+      })
     })
 
-    session.on('confirmed', () => {
+    session.on('confirmed', (e) => {
+      readOutbound(e)
       this._callStartedAt = Date.now()
-      this.emit('callConnected', { number: this._callNumber, bridgeId: this._bridgeId })
+      this.emit('callConnected', {
+        number: this._callNumber,
+        bridgeId: this._bridgeId,
+        outboundClid: this._outboundClid,
+        outboundLabel: this._outboundLabel,
+      })
     })
 
     const onEnd = (e) => {
@@ -763,12 +824,15 @@ export class LeadtodeedPhone extends EventEmitter {
       this._callUuid = null
       this._bridgeId = null
       this._isConference = false
+      this._outboundClid = null
+      this._outboundLabel = null
       this.emit('callEnded', {
         number: this._callNumber,
         duration,
         cause: e?.cause || 'completed',
       })
       this._callNumber = null
+      this._callClid = null
     }
 
     session.on('ended', onEnd)

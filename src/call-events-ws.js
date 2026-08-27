@@ -18,12 +18,12 @@ const RECONNECT_BASE_DELAY = 1_000  // 1s
 const RECONNECT_MAX_DELAY = 30_000  // 30s cap
 
 export class CallEventsSocket {
-  constructor({ url, token, reporter, onParticipantJoined, onParticipantLeft, onParticipantInviteFailed, onCallEnded, onRefresh }) {
+  constructor({ url, token, reporter, onParticipantJoined, onParticipantLeft, onParticipantInviteFailed, onCallEnded, onRefresh, onOutboundRejected }) {
     this._url = url
     this._token = token
     this._reporter = reporter
     this._ws = null
-    this._callbacks = { onParticipantJoined, onParticipantLeft, onParticipantInviteFailed, onCallEnded, onRefresh }
+    this._callbacks = { onParticipantJoined, onParticipantLeft, onParticipantInviteFailed, onCallEnded, onRefresh, onOutboundRejected }
     this._closedByUser = false
     this._reconnectAttempts = 0
     this._heartbeatTimer = null
@@ -81,6 +81,15 @@ export class CallEventsSocket {
             break
           case 'call_ended':
             this._callbacks.onCallEnded?.(data)
+            break
+          case 'outbound_rejected':
+            // The server refused an outgoing call because of the caller ID it
+            // asked to assert. A SIP rejection is already on its way and will
+            // end the call on its own — this event exists purely to carry the
+            // REASON, so the UI can say which number was refused instead of a
+            // generic failure. The two race; whichever lands first, the other
+            // must be harmless.
+            this._callbacks.onOutboundRejected?.(data)
             break
           case 'refresh':
             // Server-initiated force-reload. The orchestrator (index.js)

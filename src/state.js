@@ -29,6 +29,12 @@ export function createCallState() {
     bridgeId: null,
     did: null,           // the line the customer dialed (X-Did, +E.164)
     didLabel: null,      // its human name (X-Did-Label-B64, e.g. a brand)
+    outboundClid: null,  // outgoing: the line WE called from (X-Clid on the
+                         // 183/200). The mirror of `did` — that is the line
+                         // they dialled, this is the line we asserted.
+    outboundLabel: null, // its human name (X-Did-Label-B64 on the response)
+    endReason: null,     // why the call ended, when the server gave a reason
+                         // ("clid_not_allowed"); null for an ordinary hangup
   }
 }
 
@@ -64,6 +70,9 @@ export function transitionPhase(state, newPhase, attrs = {}) {
     state.bridgeId = null
     state.did = null
     state.didLabel = null
+    state.outboundClid = null
+    state.outboundLabel = null
+    state.endReason = null
   }
   return true
 }

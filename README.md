@@ -35,14 +35,17 @@ The `renderer` receives a state object on every change:
 
 ```js
 {
-  phase,        // "idle" | "ringing" | "connected" | "ended"
-  number,       // caller/callee phone number
-  direction,    // "incoming" | "outgoing"
-  connectedAt,  // timestamp (ms) when call connected
-  events,       // append-only log: [{ id, type, ts, data }]
-  accept(),     // answer incoming call
-  decline(),    // reject incoming call
-  hangup(),     // end active call
+  phase,         // "idle" | "ringing" | "connected" | "ended"
+  number,        // caller/callee phone number
+  direction,     // "incoming" | "outgoing"
+  connectedAt,   // timestamp (ms) when call connected
+  events,        // append-only log: [{ id, type, ts, data }]
+  outboundClid,  // outgoing: the line this call is going out on
+  outboundLabel, // its human name, when the server has one ("Acme Legal")
+  endReason,     // why the call ended, when the server gave a reason
+  accept(),      // answer incoming call
+  decline(),     // reject incoming call
+  hangup(),      // end active call
 }
 ```
 
@@ -53,7 +56,7 @@ The `renderer` receives a state object on every change:
 | Method | Description |
 |--------|-------------|
 | `connect()` | Fetch token, retrieve SIP config, and register. Returns a `Promise`. |
-| `call(number)` | Start an outgoing call. Non-digit characters (except `+`) are stripped. |
+| `call(number, { callerId })` | Start an outgoing call. Non-digit characters (except `+`) are stripped from `number`. `callerId` (E.164) asks the server to assert that number as caller ID on this call — see [Outbound caller ID](#outbound-caller-id). |
 | `hangup()` | End the current call. |
 | `answer()` | Answer an incoming call. |
 | `reject()` | Reject an incoming call. |
@@ -74,6 +77,34 @@ window.leadtodeedPhone.simulateEnd()
 window.leadtodeedPhone.simulateOutgoingCall('+441234567890')
 window.leadtodeedPhone.simulateEnd()
 ```
+
+## Outbound caller ID
+
+A tenant may own several numbers. `call()` takes an optional `callerId` naming
+which one this call should present:
+
+```js
+phone.call('+15551234567', { callerId: '+15559876543' })
+```
+
+It is a **request, not a guarantee**. The value travels on the INVITE as an
+`X-Clid` header, and the server decides: a number the tenant does not own gets
+the call **rejected** rather than quietly placed on a different line — a silent
+substitution would be indistinguishable from the feature working.
+
+A rejection arrives two ways, and either may land first:
+
+- a SIP rejection, which ends the call through the normal `callEnded` path;
+- an `outbound_rejected` event on the call-events socket, which sets
+  `state.endReason` (e.g. `"clid_not_allowed"`) so the UI can say *which*
+  number was refused instead of a generic failure.
+
+Once the call is up, the server echoes the line it actually used back on the SIP
+response, surfacing as `state.outboundClid` and `state.outboundLabel` — the
+outgoing mirror of the `did` / `didLabel` an incoming call carries.
+
+Omit `callerId` entirely and nothing changes: the INVITE is byte-identical to
+one from a build without this feature, and the server picks its per-user default.
 
 ## Call State Machine
 

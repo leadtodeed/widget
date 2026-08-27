@@ -210,6 +210,53 @@ describe('LeadtodeedPhone', () => {
       expect(fn).toHaveBeenCalledWith({
         number: '+1234567890',
         direction: 'outgoing',
+        callerId: null,
+      })
+    })
+
+    describe('caller ID', () => {
+      it('puts a requested caller ID on the INVITE as X-Clid', () => {
+        const phone = new LeadtodeedPhone(defaults)
+        phone.call('+1234567890', { callerId: '+15559876543' })
+        expect(phone._sip.call).toHaveBeenCalledWith('+1234567890', {
+          extraHeaders: ['X-Clid: +15559876543'],
+        })
+      })
+
+      it('dials byte-identically to before when none is requested', () => {
+        // The widget ships ahead of the server and host-app halves, so a dial
+        // with no caller ID must not change shape at all.
+        const phone = new LeadtodeedPhone(defaults)
+        phone.call('+1234567890')
+        expect(phone._sip.call).toHaveBeenCalledWith('+1234567890')
+      })
+
+      it('does not digit-strip the caller ID the way it strips the number', () => {
+        // The number goes through /[^\d+]/g to sanitise human input. Doing that
+        // to a caller ID could silently turn one valid number into another.
+        const phone = new LeadtodeedPhone(defaults)
+        phone.call('+44 1234 567890', { callerId: '+15559876543' })
+        expect(phone._sip.call).toHaveBeenCalledWith('+441234567890', {
+          extraHeaders: ['X-Clid: +15559876543'],
+        })
+      })
+
+      it('drops a malformed caller ID whole rather than truncating it', () => {
+        const phone = new LeadtodeedPhone(defaults)
+        phone.call('+1234567890', { callerId: '+1555 987 6543; DROP' })
+        expect(phone._sip.call).toHaveBeenCalledWith('+1234567890')
+      })
+
+      it('reports a callerId on callStarted so the UI can show it while ringing', () => {
+        const fn = vi.fn()
+        const phone = new LeadtodeedPhone(defaults)
+        phone.on('callStarted', fn)
+        phone.call('+1234567890', { callerId: '+15559876543' })
+        expect(fn).toHaveBeenCalledWith({
+          number: '+1234567890',
+          direction: 'outgoing',
+          callerId: '+15559876543',
+        })
       })
     })
 

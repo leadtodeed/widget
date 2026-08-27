@@ -97,6 +97,9 @@ export default function Leadtodeed({
       callUuid: state.callUuid,
       did: state.did,
       didLabel: state.didLabel,
+      outboundClid: state.outboundClid,
+      outboundLabel: state.outboundLabel,
+      endReason: state.endReason,
       accept: () => phone.answer(),
       decline: () => phone.reject(),
       hangup: () => phone.hangup(),
@@ -214,6 +217,15 @@ export default function Leadtodeed({
       onCallEnded: () => {
         // The bridge ended server-side; let the normal SIP callEnded handle phase transition
       },
+      onOutboundRejected: (data) => {
+        // Record WHY only. The SIP rejection that follows drives the phase
+        // transition, so this must not touch `phase` — the two race, and a
+        // phase change from here would fight the state machine. Survives into
+        // the 'ended' render because transitionPhase only clears on 'idle'.
+        state.endReason = data?.reason || 'rejected'
+        state.outboundClid = data?.clid || state.outboundClid
+        notify()
+      },
       onRefresh: (data) => {
         // Server (admin) asked every widget tied to this ext to reload. Log
         // what we're about to do, then reload — but never drop a live call.
@@ -269,11 +281,25 @@ export default function Leadtodeed({
     }
   })
 
-  phone.on('callStarted', ({ number, direction }) => {
+  phone.on('callStarted', ({ number, direction, callerId }) => {
     if (direction === 'outgoing') {
+      // The number we ASKED to assert. Replaced by the server's answer on the
+      // 183/200 below if it sends one — showing the request in the meantime
+      // beats showing nothing while the call rings.
+      state.outboundClid = callerId || null
       transitionPhase(state, 'ringing', { number, direction })
       notify()
     }
+  })
+
+  // The server's answer: which line the call actually went out on, and its
+  // brand label. Arrives on the first 183, so the "via <brand>" line can paint
+  // while the call is still ringing.
+  phone.on('callProgress', ({ outboundClid, outboundLabel }) => {
+    if (!outboundClid && !outboundLabel) return
+    if (outboundClid) state.outboundClid = outboundClid
+    if (outboundLabel) state.outboundLabel = outboundLabel
+    notify()
   })
 
   phone.on('registered', () => {
@@ -285,10 +311,12 @@ export default function Leadtodeed({
     if (!leadership || leadership.isLeader) _connectCallEventsWS()
   })
 
-  phone.on('callConnected', ({ bridgeId }) => {
+  phone.on('callConnected', ({ bridgeId, outboundClid, outboundLabel }) => {
     _stopRingtone()
     transitionPhase(state, 'connected', { connectedAt: Date.now() })
     if (bridgeId) state.bridgeId = bridgeId
+    if (outboundClid) state.outboundClid = outboundClid
+    if (outboundLabel) state.outboundLabel = outboundLabel
     notify()
   })
 

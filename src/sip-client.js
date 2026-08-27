@@ -80,6 +80,27 @@ function debugInviteHeaders(e, parsed) {
 }
 
 /**
+ * Decode a base64 SIP header value as UTF-8.
+ *
+ * Headers that carry free text (DID labels, participant lists) are base64'd so
+ * they survive the dialplan's Set() argument parsing and SIP's list-header
+ * comma separator. Bare atob() yields latin1 and mangles any non-ASCII name
+ * ("Renee" with an accent), so the bytes go through TextDecoder.
+ *
+ * Returns null for absent or malformed input — a broken label must never break
+ * call setup.
+ */
+export function decodeB64Header(raw) {
+  if (!raw) return null
+  try {
+    const bytes = Uint8Array.from(atob(raw), c => c.charCodeAt(0))
+    return new TextDecoder().decode(bytes) || null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Patch RTCPeerConnection to force ICE gathering completion after timeout.
  * Asterisk WebRTC can take too long to gather ICE candidates.
  */
@@ -391,12 +412,17 @@ export class SipClient {
     })
   }
 
-  call(number) {
+  call(number, { extraHeaders } = {}) {
     if (!this._ua || !this._ua.isRegistered()) {
       throw new Error('Not registered')
     }
 
     const options = {
+      // Custom X- headers on the INVITE. The server reads them off the real
+      // PJSIP channel this INVITE creates, so unlike the inbound direction
+      // (where headers have to ride dialplan variables through a Local
+      // channel) they can go straight on the request.
+      ...(extraHeaders?.length ? { extraHeaders } : {}),
       mediaConstraints: { audio: this._audioConstraint(), video: false },
       pcConfig: {
         iceServers: this._iceServers,
@@ -611,14 +637,7 @@ export class SipClient {
     // or non-ASCII tomorrow) and must survive the dialplan's Set() argument
     // parsing. TextDecoder, not bare atob — atob yields latin1.
     const did = request?.getHeader?.('X-Did') || null
-    let didLabel = null
-    try {
-      const rawLabel = request?.getHeader?.('X-Did-Label-B64')
-      if (rawLabel) {
-        const bytes = Uint8Array.from(atob(rawLabel), c => c.charCodeAt(0))
-        didLabel = new TextDecoder().decode(bytes) || null
-      }
-    } catch { /* ignore malformed header */ }
+    const didLabel = decodeB64Header(request?.getHeader?.('X-Did-Label-B64'))
     let participants = []
     try {
       // Base64, not raw JSON: JSON can't traverse the dialplan safely (its
