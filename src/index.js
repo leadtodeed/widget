@@ -286,7 +286,15 @@ export default function Leadtodeed({
       // The number we ASKED to assert. Replaced by the server's answer on the
       // 183/200 below if it sends one — showing the request in the meantime
       // beats showing nothing while the call rings.
-      state.outboundClid = callerId || null
+      //
+      // Only ever SET, never cleared: callStarted fires twice on an outgoing
+      // call — once at dial with the requested clid, and again on the 200 OK,
+      // where the session has no clid to report. Treating the second one as
+      // "no caller id" wiped a perfectly good value at the moment the call was
+      // answered, so a tel: link's ;clid= showed "via <number>" all through
+      // ringing and then lost it exactly when the two parties started talking.
+      // The state is cleared on idle, which is the only place it should be.
+      if (callerId) state.outboundClid = callerId
       transitionPhase(state, 'ringing', { number, direction })
       notify()
     }

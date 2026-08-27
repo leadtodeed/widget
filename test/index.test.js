@@ -388,6 +388,50 @@ describe('Leadtodeed()', () => {
     expect(state.sendDTMF).toBeTypeOf('function')
   })
 
+  // Regression: an outgoing call answered used to lose its "via <line>" label
+  // at the exact moment the two parties started talking. callStarted fires
+  // twice for one outgoing call — at dial with the requested clid, and again
+  // on the 200 OK where the session has none — and the handler was treating
+  // the second as "no caller id" rather than "nothing new to say".
+  it('keeps the requested caller ID when the call is answered', () => {
+    const renderer = vi.fn()
+    const phone = Leadtodeed({ subdomain: 'test', tokenUrl: '/api/token', renderer })
+
+    phone.emit('callStarted', {
+      number: '+447395871938', direction: 'outgoing', callerId: '+447822000140',
+    })
+    expect(renderer.mock.calls.at(-1)[0].outboundClid).toBe('+447822000140')
+
+    // The re-emit on answer, as JsSIP's 'accepted' produced it.
+    phone.emit('callStarted', { number: '+447395871938', direction: 'outgoing' })
+    expect(renderer.mock.calls.at(-1)[0].outboundClid).toBe('+447822000140')
+
+    // And through the connect, where the server sent no X-Clid of its own —
+    // which is the case that made this invisible in testing with a labelled
+    // tenant line.
+    phone.emit('callConnected', { number: '+447395871938' })
+    expect(renderer.mock.calls.at(-1)[0].outboundClid).toBe('+447822000140')
+    expect(renderer.mock.calls.at(-1)[0].phase).toBe('connected')
+  })
+
+  // The server's answer still wins: it knows which line the call actually went
+  // out on, and we only asked.
+  it('lets the server override the requested caller ID', () => {
+    const renderer = vi.fn()
+    const phone = Leadtodeed({ subdomain: 'test', tokenUrl: '/api/token', renderer })
+
+    phone.emit('callStarted', {
+      number: '+447395871938', direction: 'outgoing', callerId: '+447822000140',
+    })
+    phone.emit('callProgress', {
+      outboundClid: '+442046205000', outboundLabel: 'Collective Legal',
+    })
+
+    const state = renderer.mock.calls.at(-1)[0]
+    expect(state.outboundClid).toBe('+442046205000')
+    expect(state.outboundLabel).toBe('Collective Legal')
+  })
+
   it('calls renderer with ringing state on outgoing call', () => {
     const renderer = vi.fn()
     const phone = Leadtodeed({ subdomain: 'test', tokenUrl: '/api/token', renderer })

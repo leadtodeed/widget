@@ -782,7 +782,13 @@ export class LeadtodeedPhone extends EventEmitter {
     }
 
     session.on('accepted', () => {
-      this.emit('callStarted', { number: this._callNumber, direction })
+      // callerId included so the two callStarted emits for one outgoing call
+      // agree. The consumer no longer clears on its absence, but an event that
+      // describes the same call differently depending on when it fired is a
+      // trap for the next consumer as much as it was for the last one.
+      this.emit('callStarted', {
+        number: this._callNumber, direction, callerId: this._callClid,
+      })
     })
 
     // The server echoes back which line the call actually went out on, so
