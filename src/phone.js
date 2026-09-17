@@ -107,6 +107,7 @@ export class LeadtodeedPhone extends EventEmitter {
   constructor({
     subdomain,
     tokenUrl,
+    tokenProvider,
     sessionId,
     telemetryRateLimit,
     getAudioConstraints,
@@ -121,10 +122,10 @@ export class LeadtodeedPhone extends EventEmitter {
     super()
 
     if (!subdomain) throw new Error('subdomain is required')
-    if (!tokenUrl) throw new Error('tokenUrl is required')
+    if (!tokenUrl && !tokenProvider) throw new Error('tokenUrl or tokenProvider is required')
 
     this._leadtodeedUrl = `https://${subdomain}.leadtodeed.ai`
-    this._auth = new AuthManager({ tokenUrl })
+    this._auth = new AuthManager({ tokenUrl, tokenProvider })
     this._sessionId = sessionId || _makeSessionId()
     this._reporter = new Reporter({
       leadtodeedUrl: this._leadtodeedUrl,

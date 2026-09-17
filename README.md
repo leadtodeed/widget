@@ -49,6 +49,42 @@ The `renderer` receives a state object on every change:
 }
 ```
 
+## Extension federation
+
+When the leadtodeed Chrome extension (l2d-ext) is installed, its offscreen
+document is a strictly more stable SIP holder than any tab — it survives page
+refreshes, tab closes, and (with the `background` permission) closing the last
+window. On init the widget probes for the extension's bridge content script
+(`window.postMessage` handshake). A healthy extension running as the **same
+identity** (JWT `sub`) wins: the page widget skips SIP registration entirely
+and renders the extension's relayed state through the normal `renderer` —
+states arrive with `viaExtension: true`, and `call()`/`accept()`/etc. forward
+over the bridge. If the extension disappears (bye, or 90s of silence), the
+usual same-origin tab election resumes automatically.
+
+On a `sub` mismatch the widget keeps its own SIP (both register; the PBX
+allows multiple contacts) and passes `extensionIdentity: {sub, displayName}`
+in every render so the UI can hint "extension is signed in as …".
+
+Related options:
+
+```js
+Leadtodeed({
+  subdomain: 'acme',
+  tokenProvider: async () => myJwt,  // instead of tokenUrl — for contexts with
+                                     // their own auth (the extension offscreen doc)
+  leadership: false,                 // no tab election — the extension offscreen
+                                     // doc is structurally the only SIP owner
+  extensionFederation: false,        // opt out of the probe entirely
+  onRefreshRequested: (data) => {},  // overrides the location.reload() on a
+                                     // server-initiated refresh
+  capabilities: {                    // injected controller capabilities; stored
+    getEnrichment: async (num) => {},//   on phone.capabilities, getEnrichment
+    getAddTargets: async () => [],   //   aliases onIncomingCall
+  },
+})
+```
+
 ## Methods
 
 `Leadtodeed()` returns a `LeadtodeedPhone` instance:

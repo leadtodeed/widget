@@ -18,12 +18,12 @@ const RECONNECT_BASE_DELAY = 1_000  // 1s
 const RECONNECT_MAX_DELAY = 30_000  // 30s cap
 
 export class CallEventsSocket {
-  constructor({ url, token, reporter, onParticipantJoined, onParticipantLeft, onParticipantInviteFailed, onCallEnded, onRefresh, onOutboundRejected }) {
+  constructor({ url, token, reporter, onParticipantJoined, onParticipantLeft, onParticipantInviteFailed, onCallEnded, onRefresh, onOutboundRejected, onAnnotationUpdated = null }) {
     this._url = url
     this._token = token
     this._reporter = reporter
     this._ws = null
-    this._callbacks = { onParticipantJoined, onParticipantLeft, onParticipantInviteFailed, onCallEnded, onRefresh, onOutboundRejected }
+    this._callbacks = { onParticipantJoined, onParticipantLeft, onParticipantInviteFailed, onCallEnded, onRefresh, onOutboundRejected, onAnnotationUpdated }
     this._closedByUser = false
     this._reconnectAttempts = 0
     this._heartbeatTimer = null
@@ -96,6 +96,15 @@ export class CallEventsSocket {
             // decides whether to reload immediately or defer until the
             // current call ends.
             this._callbacks.onRefresh?.(data)
+            break
+          case 'annotation_updated':
+            // The call's shared annotation (case link, form answers, notes,
+            // machine facts) changed on the platform — another participant
+            // or an automated agent wrote to it. Carries the merged document
+            // and its version; the host decides what to repaint. No state
+            // change here: the annotation is the host's concern, not the
+            // phone's.
+            this._callbacks.onAnnotationUpdated?.(data)
             break
           case 'pong':
             // Heartbeat ack — already refreshed above

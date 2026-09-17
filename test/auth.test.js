@@ -141,3 +141,66 @@ describe('AuthManager', () => {
     })
   })
 })
+
+describe('AuthManager with tokenProvider', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('requires tokenUrl or tokenProvider', () => {
+    expect(() => new AuthManager({})).toThrow('tokenUrl or tokenProvider is required')
+  })
+
+  it('fetches via the provider and never touches fetch', async () => {
+    vi.useFakeTimers()
+    const token = fakeJwt({ exp: Math.floor(Date.now() / 1000) + 3600, sub: '138028' })
+    const provider = vi.fn().mockResolvedValue(token)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const auth = new AuthManager({ tokenProvider: provider })
+
+    await expect(auth.fetchToken()).resolves.toBe(token)
+    expect(auth.token).toBe(token)
+    expect(provider).toHaveBeenCalledTimes(1)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    auth.destroy()
+  })
+
+  it('schedules refresh through the provider (re-brokering for free)', async () => {
+    vi.useFakeTimers()
+    const exp = Math.floor(Date.now() / 1000) + 3600
+    const provider = vi.fn()
+      .mockResolvedValueOnce(fakeJwt({ exp }))
+      .mockResolvedValueOnce(fakeJwt({ exp: exp + 3600 }))
+    const auth = new AuthManager({ tokenProvider: provider })
+
+    await auth.fetchToken()
+    expect(auth._refreshTimer).not.toBeNull()
+    // 5 minutes before expiry the provider is asked again.
+    await vi.advanceTimersByTimeAsync(55 * 60 * 1000 + 1000)
+    expect(provider).toHaveBeenCalledTimes(2)
+    auth.destroy()
+  })
+
+  it('rejects when the provider returns nothing', async () => {
+    const auth = new AuthManager({ tokenProvider: async () => null })
+    await expect(auth.fetchToken()).rejects.toThrow('tokenProvider returned no token')
+  })
+
+  it('exposes the sub claim after fetch', async () => {
+    const auth = new AuthManager({
+      tokenProvider: async () => fakeJwt({ exp: Math.floor(Date.now() / 1000) + 60, sub: '7005' }),
+    })
+    expect(auth.sub).toBeNull()
+    await auth.fetchToken()
+    expect(auth.sub).toBe('7005')
+    auth.destroy()
+  })
+
+  it('sub is null on an unparseable token', async () => {
+    const auth = new AuthManager({ tokenProvider: async () => 'not-a-jwt' })
+    await auth.fetchToken()
+    expect(auth.sub).toBeNull()
+    auth.destroy()
+  })
+})

@@ -41,9 +41,17 @@ describe('LeadtodeedPhone', () => {
         .toThrow('subdomain is required')
     })
 
-    it('throws if tokenUrl is missing', () => {
+    it('throws if both tokenUrl and tokenProvider are missing', () => {
       expect(() => new LeadtodeedPhone({ subdomain: 'example' }))
-        .toThrow('tokenUrl is required')
+        .toThrow('tokenUrl or tokenProvider is required')
+    })
+
+    it('accepts a tokenProvider instead of tokenUrl', () => {
+      const phone = new LeadtodeedPhone({
+        subdomain: 'example',
+        tokenProvider: async () => 'jwt',
+      })
+      expect(phone).toBeInstanceOf(LeadtodeedPhone)
     })
 
     it('creates instance with valid params', () => {
